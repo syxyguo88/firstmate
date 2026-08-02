@@ -29,11 +29,13 @@ install_cd_scripts() {
   cp "$ROOT/bin/fm-cd-pretool-check.sh" "$dir/bin/fm-cd-pretool-check.sh"
   cp "$ROOT/bin/fm-cd-command-policy.mjs" "$dir/bin/fm-cd-command-policy.mjs"
   cp "$ROOT/bin/fm-arm-command-policy.mjs" "$dir/bin/fm-arm-command-policy.mjs"
+  cp "$ROOT/bin/fm-primary-scope-lib.sh" "$dir/bin/fm-primary-scope-lib.sh"
   chmod +x "$dir/bin/fm-cd-pretool-check.sh" "$dir/bin/fm-cd-command-policy.mjs"
 }
 
 make_primary_fixture() {
   local dir=$1
+  mkdir -p "$dir/state"
   git init -q "$dir"
   git -C "$dir" commit -q --allow-empty -m init
   : > "$dir/AGENTS.md"
@@ -370,6 +372,94 @@ test_policy_cli_direct() {
   pass "cd-guard: fm-cd-command-policy.mjs CLI honors the deny/allow output contract"
 }
 
+test_cursor_native_deny_allow_and_duplicate_suppression() {
+  local payload out rc
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"cd projects/foo"}}'
+  out=$(printf '%s' "$payload" | "$CHECK" --cursor 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "--cursor cd deny must exit 0, got $rc"
+  printf '%s' "$out" | jq -e '
+    (keys | sort) == ["agent_message", "permission", "user_message"]
+    and .permission == "deny"
+    and (.user_message | contains("[persistent-cd]"))
+    and (.agent_message | contains("[persistent-cd]"))
+  ' >/dev/null 2>&1 || fail "--cursor cd deny must be flat native JSON with its reason: $out"
+
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"git -C projects/foo status"}}'
+  out=$(printf '%s' "$payload" | "$CHECK" --cursor 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "--cursor cd allow must exit 0, got $rc"
+  [ -z "$out" ] || fail "--cursor cd allow must be silent: $out"
+
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"cd projects/foo"}}'
+  out=$(printf '%s' "$payload" | "$CHECK" --claude 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "--claude must suppress native Cursor cd duplicate, got $rc"
+  [ -z "$out" ] || fail "--claude native Cursor cd duplicate must be silent: $out"
+
+  for payload in \
+    '{"cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"cd projects/foo"}}' \
+    '{"hook_event_name":"damaged","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"cd projects/foo"}}'
+  do
+    rc=0
+    out=$(printf '%s' "$payload" | "$CHECK" --claude 2>&1) || rc=$?
+    [ "$rc" -eq 0 ] || fail "--claude must suppress partial Cursor cd payload, got $rc"
+    [ -z "$out" ] || fail "--claude partial Cursor cd payload must be silent: $out"
+  done
+
+  rc=0
+  out=$(printf '%s' '{"tool_name":"Shell","tool_input":{"command":"cd projects/foo"}}' \
+    | CURSOR_AGENT=1 "$CHECK" --claude 2>&1) || rc=$?
+  [ "$rc" -eq 2 ] || fail "CURSOR_AGENT alone must not suppress an ordinary Claude cd deny, got $rc"
+  assert_contains "$out" '[persistent-cd]' "ordinary Claude cd deny lost its reason"
+  pass "cd-guard --cursor: native behavior remains strict while Claude suppresses partial Cursor-versioned objects"
+}
+
+test_cursor_malformed_transport_fails_open() {
+  local payload out rc
+  for payload in \
+    '{not-json' \
+    '{}' \
+    '{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Shell","tool_input":"cd projects/foo"}' \
+    '{"hook_event_name":"stop","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"cd projects/foo"}}'
+  do
+    out=$(printf '%s' "$payload" | "$CHECK" --cursor 2>&1)
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "invalid Cursor cd payload must fail open, got $rc"
+    [ -z "$out" ] || fail "invalid Cursor cd payload must be silent: $out"
+  done
+  pass "cd-guard --cursor: malformed and wrong-event payloads fail open silently"
+}
+
+test_cursor_scope_keeps_linked_worker_inert_and_secondmate_active() {
+  local base worker second payload out rc
+  base="$TMP_ROOT/cursor-cd-scope-base"
+  worker="$TMP_ROOT/cursor-cd-scope-worker"
+  second="$TMP_ROOT/cursor-cd-scope-secondmate"
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"cd projects/foo"}}'
+
+  make_child_worktree_fixture "$base" "$worker" >/dev/null
+  mkdir -p "$worker/state"
+  out=$(printf '%s' "$payload" | FM_HOME="$worker" \
+    "$worker/bin/fm-cd-pretool-check.sh" --cursor 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "Cursor cd worker no-op must exit 0, got $rc"
+  [ -z "$out" ] || fail "Cursor cd guard fired in a linked worker: $out"
+
+  git -C "$base" worktree add --quiet -b fm/cursor-cd-secondmate "$second"
+  mkdir -p "$second/state"
+  : > "$second/AGENTS.md"
+  printf 'cursor-cd-sm\n' > "$second/.fm-secondmate-home"
+  install_cd_scripts "$second"
+  out=$(printf '%s' "$payload" | FM_HOME="$second" \
+    "$second/bin/fm-cd-pretool-check.sh" --cursor 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "Cursor cd secondmate deny must exit 0, got $rc"
+  printf '%s' "$out" | jq -e '.permission == "deny"' >/dev/null 2>&1 \
+    || fail "Cursor cd guard did not activate in a linked secondmate primary: $out"
+  pass "cd-guard --cursor: linked worker is inert and linked secondmate primary is active"
+}
+
 # --- per-harness wiring -----------------------------------------------------
 
 test_scripts_are_shellcheck_clean() {
@@ -391,4 +481,7 @@ test_fail_open_missing_node
 test_fail_open_missing_jq_on_stdin
 test_prefilter_skips_node_without_cd_substring
 test_policy_cli_direct
+test_cursor_native_deny_allow_and_duplicate_suppression
+test_cursor_malformed_transport_fails_open
+test_cursor_scope_keeps_linked_worker_inert_and_secondmate_active
 test_scripts_are_shellcheck_clean

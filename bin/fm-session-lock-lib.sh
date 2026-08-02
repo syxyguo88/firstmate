@@ -8,8 +8,65 @@
 # lock-owning primary session before it may arm or rewake.
 # This file is sourced by scripts and has no side effects on source.
 
-# Known harness command names; extend when a new adapter is verified.
+# Known non-Cursor harness command names; extend when a new adapter is verified.
+# Cursor stays out of this broad regex because its official command is the
+# generic name `agent` and requires the exact matcher below.
 FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$'
+
+# True when command/argv carry explicit Cursor agent process identity.
+# Exact cursor-agent basenames are authoritative. The official generic `agent`
+# must have the matching agent launch name as argv[0], optionally followed by
+# the verified --use-system-ca flag, then the versioned Cursor index.js entry.
+# Legacy Node must have that index.js as its immediate entry-script argument;
+# later argv mentions do not count. This marker-independent form is used when
+# checking an external lock-holder PID.
+fm_cursor_agent_args_match() {
+  local comm=$1 args=$2 argv0 first second rest entry
+  local IFS=$' \t\n'
+  read -r argv0 first second rest <<<"$args"
+  [ "$(basename -- "$argv0")" = "$(basename -- "$comm")" ] || return 1
+  if [ "$first" = "--use-system-ca" ]; then
+    entry=$second
+  else
+    entry=$first
+  fi
+  printf '%s\n' "$entry" \
+    | grep -qE '^[^[:space:]]*/cursor-agent/versions/[^/[:space:]]+/index\.js$'
+}
+
+fm_cursor_explicit_process_matches() {
+  local comm=$1 args=$2 bc
+  bc=$(basename -- "$comm")
+  case "$bc" in
+    cursor-agent)
+      return 0
+      ;;
+    agent)
+      fm_cursor_agent_args_match "$comm" "$args"
+      ;;
+    node*)
+      printf '%s\n' "$args" \
+        | grep -qE '^([^[:space:]]*/)?node[^/[:space:]]*[[:space:]]+[^[:space:]]*/cursor-agent/versions/[^/[:space:]]+/index\.js([[:space:]]|$)'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# True when one process in the current ancestry is Cursor.
+# The generic official `agent` name additionally requires the inherited Cursor
+# marker. This keeps marker-only environments and ordinary agent processes from
+# claiming current-session identity while external holder checks remain stable.
+fm_cursor_process_matches() {
+  local comm=$1 args=$2
+  case "$(basename -- "$comm")" in
+    agent)
+      [ "${CURSOR_AGENT:-}" = "1" ] || return 1
+      ;;
+  esac
+  fm_cursor_explicit_process_matches "$comm" "$args"
+}
 
 # Walk the current process ancestry (up to 16 hops) and print a harness pid.
 # For every harness except Claude, the first match wins (innermost pid), which
@@ -33,7 +90,9 @@ fm_harness_ancestry_pid() {
     args=$(ps -o args= -p "$pid" 2>/dev/null)
     bc=$(basename -- "$comm")
     hit=0; is_claude=0
-    if printf '%s' "$bc" | grep -qE "$FM_HARNESS_RE"; then
+    if fm_cursor_process_matches "$comm" "$args"; then
+      hit=1
+    elif printf '%s' "$bc" | grep -qE "$FM_HARNESS_RE"; then
       hit=1
       case "$bc" in *claude*) is_claude=1 ;; esac
     else
@@ -69,12 +128,15 @@ fm_harness_pid_alive() {
   local pid=$1 comm args
   kill -0 "$pid" 2>/dev/null || return 1
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  if fm_cursor_explicit_process_matches "$comm" "$args"; then
+    return 0
+  fi
   if printf '%s' "$(basename -- "$comm")" | grep -qE "$FM_HARNESS_RE"; then
     return 0
   fi
   case "$comm" in
     *node*|*python*)
-      args=$(ps -o args= -p "$pid" 2>/dev/null)
       printf '%s' "$args" | grep -qE "$FM_HARNESS_RE"
       ;;
     *) return 1 ;;

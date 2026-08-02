@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "\"$CURSOR_PROJECT_DIR\"/bin/fm-sessionstart-nudge.sh --cursor",
+        "timeout": 10
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "\"$CURSOR_PROJECT_DIR\"/bin/fm-arm-pretool-check.sh --cursor",
+        "matcher": "Shell"
+      },
+      {
+        "command": "\"$CURSOR_PROJECT_DIR\"/bin/fm-cd-pretool-check.sh --cursor",
+        "matcher": "Shell"
+      },
+      {
+        "command": "\"$CURSOR_PROJECT_DIR\"/bin/fm-subagent-pretool-check.sh --cursor",
+        "matcher": ".*"
+      }
+    ],
+    "stop": [
+      {
+        "command": "\"$CURSOR_PROJECT_DIR\"/bin/fm-turnend-guard.sh --cursor",
+        "timeout": 30,
+        "loop_limit": 3
+      }
+    ]
+  }
+}

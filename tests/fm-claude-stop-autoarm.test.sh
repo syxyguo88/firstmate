@@ -67,8 +67,8 @@ make_crewmate_worktree_dir() {
 # session lock. $1 = fixture dir. Any extra env assignments must be exported
 # before invocation. Captures stdout+stderr; exit code on stdout of the caller.
 run_autoarm() {
-  local dir=$1 rc=0
-  printf '%s\n' '{"session_id":"sess-autoarm","stop_hook_active":false}' \
+  local dir=$1 payload=${2:-'{"session_id":"sess-autoarm","stop_hook_active":false}'} rc=0
+  printf '%s\n' "$payload" \
     | FM_HOME="$dir" "$FAKE_CLAUDE" -c '
         printf "%s\n" "$$" > "$FM_HOME/state/.lock"
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
@@ -294,6 +294,56 @@ test_inert_when_fleet_idle() {
   pass "auto-arm: inert with nothing in flight and no X-mode need"
 }
 
+test_native_cursor_payload_is_suppressed_without_cursor_env() {
+  local dir payload out status index=0
+  for payload in \
+    '{"hook_event_name":"stop","cursor_version":"2.1.0","status":"completed","loop_count":0}' \
+    '{"cursor_version":"2.1.0"}' \
+    '{"hook_event_name":"damaged","cursor_version":"2.1.0"}'
+  do
+    index=$((index + 1))
+    dir=$(make_primary_dir "$TMP_ROOT/cursor-native-payload-$index")
+    : > "$dir/state/task.meta"
+    write_arm_fixture "$dir" actionable
+    out=$(run_autoarm "$dir" "$payload" 2>/dev/null); status=$?
+    expect_code 0 "$status" "Claude auto-arm must suppress complete or partial Cursor payload"
+    [ -z "$out" ] || fail "Cursor-versioned payload produced Claude auto-arm output: $out"
+    [ ! -e "$dir/state/arm-ran" ] || fail "Cursor-versioned payload started the Claude auto-arm"
+    [ ! -e "$dir/state/.claude-autoarm.lock" ] || fail "Cursor-versioned payload claimed the Claude auto-arm lock"
+    [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "Cursor-versioned payload wrote a Claude epoch"
+  done
+  pass "Claude auto-arm: any Cursor-versioned object is silent before Claude state is touched"
+}
+
+test_cursor_env_alone_and_missing_jq_preserve_claude_behavior() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/cursor-env-only")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  out=$(CURSOR_AGENT=1 run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "CURSOR_AGENT alone must not suppress an ordinary Claude Stop"
+  [ -e "$dir/state/arm-ran" ] || fail "CURSOR_AGENT alone prevented the ordinary Claude auto-arm"
+
+  dir=$(make_primary_dir "$TMP_ROOT/no-jq-ordinary")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  out=$(FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    command() {
+      if [ "${1:-}" = "-v" ] && [ "${2:-}" = "jq" ]; then
+        return 1
+      fi
+      builtin command "$@"
+    }
+    export -f command
+    printf "%s\n" "{\"session_id\":\"no-jq\",\"stop_hook_active\":false}" \
+      | bash "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
+  ' 2>/dev/null); status=$?
+  expect_code 2 "$status" "missing jq must preserve ordinary Claude auto-arm behavior"
+  [ -e "$dir/state/arm-ran" ] || fail "missing jq prevented the ordinary Claude auto-arm"
+  pass "Claude auto-arm: CURSOR_AGENT alone and missing jq do not change ordinary Claude behavior"
+}
+
 # --- the armed cycle ----------------------------------------------------------
 
 test_actionable_close_rewakes_with_reason() {
@@ -424,6 +474,8 @@ test_inert_when_afk
 test_stale_lock_recovery_preserves_afk_and_need_gates
 test_resolves_outermost_claude_pid_in_nested_bgspare_chain
 test_inert_when_fleet_idle
+test_native_cursor_payload_is_suppressed_without_cursor_env
+test_cursor_env_alone_and_missing_jq_preserve_claude_behavior
 test_actionable_close_rewakes_with_reason
 test_failed_close_rewakes_with_failure_banner
 test_clean_close_exits_silently

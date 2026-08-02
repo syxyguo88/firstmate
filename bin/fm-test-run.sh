@@ -117,12 +117,17 @@ now_ms() {
 # unclassified so new tests are still runnable and visible in summaries.
 family_for_basename() {
   case "$1" in
+    fm-cursor-acp-bridge.test.sh|fm-cursor-runtime-wiring.test.sh)
+      printf '%s\n' cursor-acp
+      ;;
     fm-arm-pretool-check.test.sh|fm-ask-user-authority.test.sh|\
     fm-brief.test.sh|fm-vendor-auth-probe.test.sh|\
     fm-calm-pi-extension.test.sh|fm-cd-pretool-check.test.sh|\
     fm-composer-ghost.test.sh|fm-composer-lib.test.sh|\
     fm-crew-state.test.sh|fm-decision-hold-lifecycle.test.sh|\
-    fm-documentation-audiences.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
+    fm-cursor-harness.test.sh|fm-cursor-live-contract.test.sh|fm-cursor-primary-hooks.test.sh|\
+    fm-documentation-audiences.test.sh|\
+    fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
     fm-kimi-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|\
@@ -131,7 +136,8 @@ family_for_basename() {
     fm-test-run.test.sh|fm-test-isolation-proof.test.sh)
       printf '%s\n' pure-contract-unit
       ;;
-    fm-daemon.test.sh|fm-guard-stale-banner.test.sh|fm-pi-watch-extension.test.sh|\
+    fm-claude-stop-autoarm.test.sh|fm-daemon.test.sh|\
+    fm-guard-stale-banner.test.sh|fm-pi-watch-extension.test.sh|\
     fm-supervision-events.test.sh|fm-turnend-guard.test.sh|fm-wake-daemon-lifecycle-e2e.test.sh|\
     fm-wake-queue.test.sh|fm-watch-checkpoint.test.sh|fm-watch-triage.test.sh|\
     fm-watcher-lock.test.sh)
@@ -158,6 +164,8 @@ family_for_basename() {
       ;;
     fm-afk-pi-herdr-return-e2e.test.sh|\
     fm-codex-continuity-live-e2e.test.sh|fm-grok-continuity-live-e2e.test.sh|\
+    fm-cursor-acp-cli-contract-live-e2e.test.sh|fm-cursor-acp-live-e2e.test.sh|\
+    fm-cursor-primary-live-e2e.test.sh|\
     fm-grok-stop-live-e2e.test.sh|fm-opencode-primary-live-e2e.test.sh|fm-pi-primary-live-e2e.test.sh|\
     fm-quota-array-dispatch-live-e2e.test.sh|fm-send-secondmate-marker-herdr-e2e.test.sh)
       printf '%s\n' live-harness-optin
@@ -205,6 +213,7 @@ expected_gate_skip_for_family() {
 
 list_known_families() {
   cat <<'EOF'
+cursor-acp
 pure-contract-unit
 watcher-wake-lock
 real-herdr-gated
@@ -592,6 +601,16 @@ families_for_test_reference() {
 families_for_changed_path() {
   local path=$1 fixture_ref
   case "$path" in
+    bin/fm-cursor-acp-bridge.mjs)
+      printf '%s\n' cursor-acp
+      printf '%s\n' live-harness-optin
+      printf '%s\n' "__script__:fm-secondmate-liveness.test.sh"
+      ;;
+    bin/fm-busy-lib.sh)
+      printf '%s\n' cursor-acp
+      printf '%s\n' live-harness-optin
+      printf '%s\n' "__script__:fm-busy-state.test.sh"
+      ;;
     tests/fm-test-run.test.sh)
       printf '%s\n' pure-contract-unit
       ;;
@@ -608,6 +627,11 @@ families_for_changed_path() {
       printf '%s\n' pure-contract-unit
       ;;
     bin/backends/herdr*|bin/fm-herdr-lab.sh|tests/herdr-test-safety.sh)
+      printf '%s\n' cursor-acp
+      printf '%s\n' live-harness-optin
+      case "$path" in
+        bin/backends/herdr*) printf '%s\n' "__script__:fm-secondmate-liveness.test.sh" ;;
+      esac
       printf '%s\n' real-herdr-gated
       printf '%s\n' backend-dispatch
       printf '%s\n' pure-contract-unit
@@ -625,16 +649,34 @@ families_for_changed_path() {
       printf '%s\n' cmux
       printf '%s\n' backend-dispatch
       ;;
-    bin/backends/orca*|bin/backends/tmux.sh)
+    bin/backends/tmux.sh)
+      printf '%s\n' cursor-acp
+      printf '%s\n' live-harness-optin
+      printf '%s\n' "__script__:fm-secondmate-liveness.test.sh"
       printf '%s\n' backend-dispatch
       printf '%s\n' orca
       ;;
-    bin/fm-backend.sh|bin/fm-backend-hometag-lib.sh)
+    bin/backends/orca*)
+      printf '%s\n' backend-dispatch
+      printf '%s\n' orca
+      ;;
+    bin/fm-backend.sh)
+      printf '%s\n' cursor-acp
+      printf '%s\n' live-harness-optin
+      printf '%s\n' "__script__:fm-secondmate-liveness.test.sh"
       printf '%s\n' backend-dispatch
       printf '%s\n' real-herdr-gated
       ;;
+    bin/fm-backend-hometag-lib.sh)
+      printf '%s\n' backend-dispatch
+      printf '%s\n' real-herdr-gated
+      ;;
+    bin/fm-turnend-guard*)
+      printf '%s\n' watcher-wake-lock
+      printf '%s\n' live-harness-optin
+      ;;
     bin/fm-watch*|bin/fm-wake*|\
-    bin/fm-classify-lib.sh|bin/fm-daemon*|bin/fm-turnend-guard*|bin/fm-guard.sh)
+    bin/fm-classify-lib.sh|bin/fm-daemon*|bin/fm-guard.sh)
       printf '%s\n' watcher-wake-lock
       ;;
     bin/fm-afk*)
@@ -655,17 +697,59 @@ families_for_changed_path() {
     bin/fm-config-inherit-lib.sh|bin/fm-config-push.sh|bin/fm-shared*)
       printf '%s\n' secondmate
       ;;
-    bin/fm-session-start.sh|bin/fm-bootstrap.sh|bin/fm-fleet-sync.sh|\
-    bin/fm-sessionstart-nudge.sh|bin/fm-tangle*|bin/fm-update.sh|\
+    bin/fm-bootstrap.sh)
+      printf '%s\n' cursor-acp
+      printf '%s\n' live-harness-optin
+      printf '%s\n' "__script__:fm-secondmate-liveness.test.sh"
+      printf '%s\n' session-bootstrap
+      ;;
+    bin/fm-sessionstart-nudge.sh)
+      printf '%s\n' session-bootstrap
+      printf '%s\n' live-harness-optin
+      ;;
+    bin/fm-session-start.sh)
+      printf '%s\n' session-bootstrap
+      printf '%s\n' live-harness-optin
+      ;;
+    bin/fm-fleet-sync.sh|\
+    bin/fm-tangle*|bin/fm-update.sh|\
     bin/fm-gate-refuse*|bin/fm-lock*|bin/fm-quota-axi-lib.sh)
       printf '%s\n' session-bootstrap
       ;;
-    bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-teardown.sh|bin/fm-review-diff.sh|\
+    bin/fm-harness.sh|bin/fm-session-lock-lib.sh)
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' session-bootstrap
+      printf '%s\n' watcher-wake-lock
+      printf '%s\n' secondmate
+      printf '%s\n' backend-dispatch
+      printf '%s\n' live-harness-optin
+      ;;
+    .cursor/hooks.json|.cursor/skills)
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' session-bootstrap
+      printf '%s\n' watcher-wake-lock
+      printf '%s\n' live-harness-optin
+      ;;
+    bin/fm-teardown.sh)
+      printf '%s\n' cursor-acp
+      printf '%s\n' pr-forge
+      printf '%s\n' live-harness-optin
+      ;;
+    bin/fm-pending-reply-lib.sh)
+      printf '%s\n' "__script__:fm-pending-reply.test.sh"
+      ;;
+    bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-review-diff.sh|\
     bin/fm-x-*|bin/fm-check*)
       printf '%s\n' pr-forge
       ;;
-    bin/fm-spawn.sh|bin/fm-send.sh|bin/fm-harness.sh|\
+    bin/fm-spawn.sh|bin/fm-send.sh|\
     bin/fm-peek.sh|bin/fm-composer*)
+      case "$path" in bin/fm-spawn.sh|bin/fm-send.sh) printf '%s\n' cursor-acp ;; esac
+      case "$path" in bin/fm-spawn.sh|bin/fm-send.sh) printf '%s\n' live-harness-optin ;; esac
+      if [ "$path" = bin/fm-send.sh ]; then
+        printf '%s\n' "__script__:fm-send-secondmate-marker.test.sh"
+        printf '%s\n' "__script__:fm-pending-reply.test.sh"
+      fi
       printf '%s\n' backend-dispatch
       printf '%s\n' pure-contract-unit
       ;;
@@ -678,13 +762,22 @@ families_for_changed_path() {
       # lane's contract coverage re-runs.
       printf '%s\n' real-herdr-gated
       ;;
+    bin/*pretool*|bin/fm-operational-input.sh|bin/fm-primary-scope-lib.sh)
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' live-harness-optin
+      ;;
+    bin/fm-supervision-instructions.sh|bin/fm-supervision-lib.sh|\
+    docs/supervision-protocols/cursor.md)
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' live-harness-optin
+      ;;
     bin/fm-lint.sh|bin/fm-install-shellcheck.sh|\
     bin/fm-brief.sh|bin/fm-ensure-agents-md.sh|bin/fm-crew-state.sh|\
     bin/fm-decision-hold.sh|bin/fm-supervision*|bin/fm-transition-lib.sh|\
-    bin/fm-tmux-lib.sh|bin/fm-marker-lib.sh|bin/fm-operational-input.sh|bin/fm-tasks-axi-lib.sh|\
+    bin/fm-tmux-lib.sh|bin/fm-marker-lib.sh|bin/fm-tasks-axi-lib.sh|\
     bin/fm-vendor-auth-probe.sh|\
-    bin/fm-primary-scope-lib.sh|bin/fm-project-mode.sh|bin/fm-promote.sh|\
-    bin/fm-ff-lib.sh|bin/fm-gotmp*|bin/*pretool*)
+    bin/fm-project-mode.sh|bin/fm-promote.sh|\
+    bin/fm-ff-lib.sh|bin/fm-gotmp*)
       printf '%s\n' pure-contract-unit
       ;;
     .agents/skills/quota-array-dispatch/SKILL.md)

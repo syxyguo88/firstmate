@@ -1020,6 +1020,48 @@ test_scripts_reject_fm_target_label_mismatch() {
   pass "fm-send: fm-id zellij targets reject pane ids whose tab label no longer matches"
 }
 
+test_endpoint_confirmed_gone_requires_valid_pane_inventory() {
+  local dir fb status
+
+  dir="$TMP_ROOT/endpoint-gone"; mkdir -p "$dir/responses"
+  printf '%s\n' '[]' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_endpoint_confirmed_gone firstmate:7' "$ROOT" \
+    || fail "valid inventory without the exact pane must confirm gone"
+
+  dir="$TMP_ROOT/endpoint-present"; mkdir -p "$dir/responses"
+  zellij_pane_response "$dir" 1 7 3
+  fb=$(make_zellij_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_endpoint_confirmed_gone firstmate:7' "$ROOT"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "inventory containing the exact pane confirmed it gone"
+
+  dir="$TMP_ROOT/endpoint-unreadable"; mkdir -p "$dir/responses"
+  printf '%s\n' 1 > "$dir/responses/1.exit"
+  fb=$(make_zellij_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_endpoint_confirmed_gone firstmate:7' "$ROOT"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "unreadable pane inventory confirmed the endpoint gone"
+
+  dir="$TMP_ROOT/endpoint-malformed"; mkdir -p "$dir/responses"
+  printf '%s\n' '[{}]' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_endpoint_confirmed_gone firstmate:7' "$ROOT"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "malformed pane entries confirmed the endpoint gone"
+  pass "zellij endpoint disappearance requires a valid inventory that omits the exact pane"
+}
+
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-backend.sh"
 
@@ -1074,3 +1116,4 @@ test_send_text_submit_send_failed_when_pane_absent
 test_scripts_route_explicit_target_through_meta_backend
 test_scripts_verify_label_for_fm_targets
 test_scripts_reject_fm_target_label_mismatch
+test_endpoint_confirmed_gone_requires_valid_pane_inventory

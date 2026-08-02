@@ -38,10 +38,11 @@ CMD=""
 CMD_SET=0
 BACKGROUND=""
 CLAUDE_MODE=0
+CURSOR_MODE=0
 
 usage() {
   cat <<'EOF'
-Usage: fm-arm-pretool-check.sh [--command <cmd>] [--background true|false] [--claude]
+Usage: fm-arm-pretool-check.sh [--command <cmd>] [--background true|false] [--claude|--cursor]
 
 With no --command, reads a PreToolUse-style JSON payload on stdin (Grok
 toolInput.command, or Claude/Codex tool_input.command).
@@ -75,7 +76,13 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --claude)
+      [ "$CURSOR_MODE" -eq 0 ] || { echo "error: --claude and --cursor are mutually exclusive" >&2; exit 2; }
       CLAUDE_MODE=1
+      shift
+      ;;
+    --cursor)
+      [ "$CLAUDE_MODE" -eq 0 ] || { echo "error: --claude and --cursor are mutually exclusive" >&2; exit 2; }
+      CURSOR_MODE=1
       shift
       ;;
     -h|--help)
@@ -94,6 +101,21 @@ if [ "$CMD_SET" -eq 0 ]; then
   PAYLOAD=$(cat 2>/dev/null || true)
   [ -n "$PAYLOAD" ] || exit 0
   command -v jq >/dev/null 2>&1 || exit 0
+  if [ "$CLAUDE_MODE" -eq 1 ] && printf '%s' "$PAYLOAD" | jq -e '
+    type == "object"
+    and (.cursor_version | type == "string" and length > 0)
+  ' >/dev/null 2>&1; then
+    exit 0
+  fi
+  if [ "$CURSOR_MODE" -eq 1 ]; then
+    printf '%s' "$PAYLOAD" | jq -e '
+      type == "object"
+      and .hook_event_name == "preToolUse"
+      and (.cursor_version | type == "string" and length > 0)
+      and (.tool_name | type == "string" and length > 0)
+      and (.tool_input | type == "object")
+    ' >/dev/null 2>&1 || exit 0
+  fi
   CMD=$(printf '%s' "$PAYLOAD" | jq -r '(.toolInput.command // .tool_input.command // empty)' 2>/dev/null) || exit 0
   [ -n "$CMD" ] || exit 0
   # Kept for transport parity only.
@@ -102,6 +124,16 @@ if [ "$CMD_SET" -eq 0 ]; then
 fi
 
 [ -n "$CMD" ] || exit 0
+
+if [ "$CURSOR_MODE" -eq 1 ]; then
+  SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || exit 0
+  ROOT=${FM_ROOT_OVERRIDE:-$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd -P)} || exit 0
+  ACTIVE_HOME=${FM_HOME:-${FM_ROOT_OVERRIDE:-$ROOT}}
+  STATE=${FM_STATE_OVERRIDE:-$ACTIVE_HOME/state}
+  # shellcheck source=bin/fm-primary-scope-lib.sh
+  . "$SCRIPT_DIR/fm-primary-scope-lib.sh"
+  fm_primary_scope_matches "$ROOT" "$STATE" || exit 0
+fi
 
 # Strict-superset prefilter (transport only; owns zero classification semantics).
 # Every protected watcher execution and every broad watcher kill resolves to the
@@ -142,9 +174,11 @@ case "$CMD" in
     ;;
 esac
 
-SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || exit 0
-ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd -P) || exit 0
-ACTIVE_HOME=${FM_HOME:-$ROOT}
+if [ "$CURSOR_MODE" -eq 0 ]; then
+  SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || exit 0
+  ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd -P) || exit 0
+  ACTIVE_HOME=${FM_HOME:-$ROOT}
+fi
 POLICY="$ROOT/bin/fm-arm-command-policy.mjs"
 
 command -v node >/dev/null 2>&1 || exit 0
@@ -168,6 +202,10 @@ json_escape() {
 
 DETAIL="[$CODE] $REASON"
 ESCAPED=$(json_escape "$DETAIL")
+if [ "$CURSOR_MODE" -eq 1 ]; then
+  printf '{"permission":"deny","user_message":"%s","agent_message":"%s"}\n' "$ESCAPED" "$ESCAPED"
+  exit 0
+fi
 printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny"},"systemMessage":"%s"}\n' "$ESCAPED" >&2
 [ "$CLAUDE_MODE" -eq 1 ] || printf '{"decision":"deny","reason":"%s"}\n' "$ESCAPED"
 exit 2

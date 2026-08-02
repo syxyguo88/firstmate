@@ -403,6 +403,36 @@ fm_backend_cmux_surface_exists() {  # <workspace_id> <surface_id>
     | jq -e --arg s "$sfid" '[.panes[]? | select(.surface_ids // [] | index($s))] | length > 0' >/dev/null 2>&1
 }
 
+# Durable-cleanup proof. A valid workspace inventory may prove the workspace
+# absent; if it is present, a valid pane inventory must omit the exact surface.
+# Transport errors and malformed JSON remain ambiguity.
+fm_backend_cmux_endpoint_confirmed_gone() {  # <target>
+  local workspaces panes
+  fm_backend_cmux_parse_target "$1" || return 1
+  workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) \
+    || return 1
+  printf '%s' "$workspaces" | jq -e --arg w "$FM_BACKEND_CMUX_WORKSPACE" '
+    (.workspaces | type) == "array"
+    and all(.workspaces[]; (.id | type) == "string")
+    and ([.workspaces[]? | select(.id == $w)] | length == 0)
+  ' >/dev/null 2>&1 && return 0
+  printf '%s' "$workspaces" | jq -e --arg w "$FM_BACKEND_CMUX_WORKSPACE" '
+    (.workspaces | type) == "array"
+    and all(.workspaces[]; (.id | type) == "string")
+    and ([.workspaces[]? | select(.id == $w)] | length > 0)
+  ' >/dev/null 2>&1 || return 1
+  panes=$(fm_backend_cmux_cli list-panes --workspace "$FM_BACKEND_CMUX_WORKSPACE" --json --id-format uuids 2>/dev/null) \
+    || return 1
+  printf '%s' "$panes" | jq -e --arg s "$FM_BACKEND_CMUX_SURFACE" '
+    (.panes | type) == "array"
+    and all(.panes[];
+      (.surface_ids | type) == "array"
+      and all(.surface_ids[]; type == "string")
+    )
+    and ([.panes[]? | select(.surface_ids | index($s))] | length == 0)
+  ' >/dev/null 2>&1
+}
+
 # fm_backend_cmux_target_ready: parse the target and verify it is live via
 # fm_backend_cmux_surface_exists (never read-screen - see that function's
 # header for the fresh-surface pitfall this avoids). When the caller knows

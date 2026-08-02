@@ -70,7 +70,7 @@
 #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
 #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi)
+#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi|cursor)
 #   overrides it for this spawn (either kind). A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
 #   new adapters. pi-signed launches that exact executable name from PATH and
@@ -425,7 +425,7 @@ FIRSTMATE_HOME=
 
 if [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|pi-signed|grok|kimi)
+    ''|claude|codex|opencode|pi|pi-signed|grok|kimi|cursor)
       ARG3=${POS[1]:-}
       ;;
     *' '*)
@@ -491,6 +491,9 @@ launch_template() {
     # Its turn-end signal is a globally configured Stop hook plus a guarded
     # per-task worktree token, so no launch placeholder belongs here.
     kimi) printf '%s' '__KIMIBIN__ __MODELFLAG__--auto' ;;
+    # Cursor workers run through the non-interactive ACP bridge. The bridge,
+    # not fm-spawn, owns starting `agent --trust --force [--model] acp`.
+    cursor) printf '%s' 'exec __BRIDGE__ --cwd __CURSORCWD__ --task-id __TASKID__ --state-dir __STATE__ --brief __BRIEF__ --busy-gen __BUSYGEN__ --role __CURSORROLE__ __MODELFLAG__' ;;
     *) return 1 ;;
   esac
 }
@@ -502,6 +505,10 @@ case "$ARG3" in
     for word in $LAUNCH; do
       case "$word" in [A-Za-z_]*=*) continue ;; *) HARNESS=$(basename "$word"); break ;; esac
     done
+    if [ "$HARNESS" = cursor ]; then
+      echo "error: raw launch command beginning with 'cursor' is refused; use bare 'cursor' or --harness cursor to select the verified ACP bridge" >&2
+      exit 1
+    fi
     ;;
   '')
     # No explicit harness: resolve from config. A secondmate AGENT launches on the
@@ -565,6 +572,14 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
   fi
 fi
 
+# Cursor ACP has a verified model selector but no effort axis. Refuse a
+# requested/configured non-default effort before any runtime endpoint exists;
+# silently omitting it would make recorded dispatch intent differ from reality.
+if [ "$HARNESS" = cursor ] && [ -n "$EFFORT" ] && [ "$EFFORT" != default ]; then
+  echo "error: Cursor harness does not support effort '$EFFORT'" >&2
+  exit 1
+fi
+
 secondmate_registry_value() {
   secondmate_registry_field "$DATA/secondmates.md" "$1" "$2"
 }
@@ -603,7 +618,7 @@ model_flag_for_harness() {
   local harness=$1 model=$2
   [ -n "$model" ] && [ "$model" != default ] || return 0
   case "$harness" in
-    claude|codex|opencode|pi|pi-signed|grok|kimi)
+    claude|codex|opencode|pi|pi-signed|grok|kimi|cursor)
       printf -- '--model %s ' "$(shell_quote "$model")"
       ;;
   esac
@@ -1364,6 +1379,15 @@ exclude_path() {
   mkdir -p "$(dirname "$EXCL")"
   grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
 }
+BUSY_GEN=
+# The bridge requires a generation for every role, including secondmate.
+# Keep this Cursor-only so existing secondmate harness semantics do not change.
+if [ "$HARNESS" = cursor ]; then
+  BUSY_GEN=$("$FM_ROOT/bin/fm-busy-event.sh" arm "$STATE_REAL" "$ID") || {
+    echo "error: failed to arm the busy-state contract for $ID" >&2
+    exit 1
+  }
+fi
 if [ "$KIND" != secondmate ]; then
   # Arm the semantic busy-state contract (bin/fm-busy-lib.sh) for every
   # adapter with a verified semantic source. The launch brief sent below IS a
@@ -1372,7 +1396,6 @@ if [ "$KIND" != secondmate ]; then
   # incarnation is rejected as stale. Grok stays on its isolated rendered-tail
   # fallback and standalone Kimi stays unknown until fm_busy_kimi_verified
   # opens, so neither is armed here.
-  BUSY_GEN=
   case "$HARNESS" in
     codex*)
       if fm_busy_codex_semantic_source; then
@@ -1651,10 +1674,23 @@ sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
 sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
+sq_bridge=$(shell_quote "$FM_ROOT/bin/fm-cursor-acp-bridge.mjs")
+sq_cursor_cwd=$(shell_quote "$WT")
+sq_task_id=$(shell_quote "$ID")
+sq_state=$(shell_quote "$STATE_REAL")
+sq_busy_gen=$(shell_quote "${BUSY_GEN:-}")
+CURSOR_ROLE=$KIND
+[ "$CURSOR_ROLE" != ship ] || CURSOR_ROLE=crew
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
+LAUNCH=${LAUNCH//__BRIDGE__/$sq_bridge}
+LAUNCH=${LAUNCH//__CURSORCWD__/$sq_cursor_cwd}
+LAUNCH=${LAUNCH//__TASKID__/$sq_task_id}
+LAUNCH=${LAUNCH//__STATE__/$sq_state}
+LAUNCH=${LAUNCH//__BUSYGEN__/$sq_busy_gen}
+LAUNCH=${LAUNCH//__CURSORROLE__/$CURSOR_ROLE}
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
 LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}

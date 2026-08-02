@@ -215,6 +215,41 @@ test_source_mismatch_cross_adapter() {
   pass "a record is trusted only by the adapter whose source wrote it"
 }
 
+test_cursor_acp_source_trust_and_failure_modes() {
+  local state gen out
+  state=$(new_state_dir cursor-acp)
+  gen=$("$EV" arm "$state" t1)
+
+  "$EV" apply "$state" t1 busy --gen "$gen" --source cursor-acp --event prompt-start
+  out=$(fm_busy_classify tmux w1 cursor t1 "$state")
+  [ "$out" = "busy cursor-acp" ] \
+    || fail "Cursor prompt-start must classify busy from cursor-acp, got '$out'"
+  out=$(fm_busy_classify tmux w1 claude t1 "$state")
+  [ "$out" = "unknown source-mismatch" ] \
+    || fail "cursor-acp must remain untrusted for Claude, got '$out'"
+
+  "$EV" apply "$state" t1 idle --gen "$gen" --source cursor-acp --event prompt-stop
+  out=$(fm_busy_classify tmux w1 cursor t1 "$state")
+  [ "$out" = "idle cursor-acp" ] \
+    || fail "Cursor prompt-stop must classify idle from cursor-acp, got '$out'"
+
+  "$EV" apply "$state" t1 busy --gen "$gen" --source claude-hook --event forged
+  out=$(fm_busy_classify tmux w1 cursor t1 "$state")
+  [ "$out" = "unknown source-mismatch" ] \
+    || fail "Cursor must reject another adapter's source, got '$out'"
+
+  printf 'garbage\n' > "$state/t1.busy-state"
+  out=$(fm_busy_classify tmux w1 cursor t1 "$state")
+  [ "$out" = "unknown malformed" ] \
+    || fail "malformed Cursor state must remain unknown, got '$out'"
+
+  rm -f "$state/t1.busy-state"
+  out=$(fm_busy_classify tmux w1 cursor t1 "$state")
+  [ "$out" = "unknown missing" ] \
+    || fail "missing Cursor state must remain unknown, got '$out'"
+  pass "Cursor trusts only cursor-acp lifecycle events; malformed, missing, and cross-adapter records remain unknown"
+}
+
 test_converted_adapters_ignore_footer_text() {
   local state out h
   state=$(new_state_dir no-footer)
@@ -368,6 +403,7 @@ test_missing_record_unknown_not_idle
 test_malformed_record_unknown
 test_record_without_sidecar_unknown
 test_source_mismatch_cross_adapter
+test_cursor_acp_source_trust_and_failure_modes
 test_converted_adapters_ignore_footer_text
 test_grok_regex_isolated
 test_codex_unverified_gate

@@ -437,6 +437,112 @@ test_allow_is_silent_both_modes() {
   pass "allow is silent on both stdout and stderr in default and --claude mode"
 }
 
+test_default_mode_ignores_unrelated_exported_internal_names() {
+  local rc
+  SCRIPT_DIR=/tmp ROOT=/tmp ACTIVE_HOME=/tmp \
+    "$CHECK" --command 'bin/fm-watch-arm.sh &' >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 2 ] \
+    || fail "default transport must keep resolving its own policy when common internal names are exported, got $rc"
+  pass "default arm transport keeps its established root resolution under unrelated exported names"
+}
+
+test_cursor_native_deny_and_allow_shapes() {
+  local payload out err rc err_file
+  err_file=$(mktemp "${TMPDIR:-/tmp}/fm-arm-pretool-cursor-stderr.XXXXXX")
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"bin/fm-watch-arm.sh &"}}'
+  out=$(printf '%s' "$payload" | "$CHECK" --cursor 2>"$err_file")
+  rc=$?
+  err=$(cat "$err_file")
+  [ "$rc" -eq 0 ] || fail "--cursor deny must return native JSON with exit 0, got $rc"
+  [ -z "$err" ] || fail "--cursor deny must leave stderr empty: $err"
+  printf '%s' "$out" | jq -e '
+    (keys | sort) == ["agent_message", "permission", "user_message"]
+    and .permission == "deny"
+    and (.user_message | contains("[watcher-background]"))
+    and (.agent_message | contains("[watcher-background]"))
+  ' >/dev/null 2>&1 || fail "--cursor deny must be flat native JSON with the concrete reason: $out"
+
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"exec bin/fm-watch-arm.sh"}}'
+  out=$(printf '%s' "$payload" | "$CHECK" --cursor 2>&1)
+  rc=$?
+  rm -f "$err_file"
+  [ "$rc" -eq 0 ] || fail "--cursor allow must exit 0, got $rc"
+  [ -z "$out" ] || fail "--cursor allow must be silent: $out"
+  pass "arm pre-tool --cursor: deny is flat native JSON and allow is silent"
+}
+
+test_cursor_transport_fail_open_and_claude_duplicate_suppression() {
+  local payload out rc
+  for payload in \
+    '{not-json' \
+    '{}' \
+    '{"hook_event_name":"PreToolUse","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"bin/fm-watch-arm.sh &"}}' \
+    '{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":7,"tool_input":{"command":"bin/fm-watch-arm.sh &"}}'
+  do
+    out=$(printf '%s' "$payload" | "$CHECK" --cursor 2>&1)
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "invalid Cursor arm payload must fail open, got $rc"
+    [ -z "$out" ] || fail "invalid Cursor arm payload must be silent: $out"
+  done
+
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"bin/fm-watch-arm.sh &"}}'
+  out=$(printf '%s' "$payload" | "$CHECK" --claude 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "--claude must suppress native Cursor duplicate, got $rc"
+  [ -z "$out" ] || fail "--claude native Cursor duplicate must be silent: $out"
+
+  for payload in \
+    '{"cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"bin/fm-watch-arm.sh &"}}' \
+    '{"hook_event_name":"damaged","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"bin/fm-watch-arm.sh &"}}'
+  do
+    rc=0
+    out=$(printf '%s' "$payload" | "$CHECK" --claude 2>&1) || rc=$?
+    [ "$rc" -eq 0 ] || fail "--claude must suppress partial Cursor arm payload, got $rc"
+    [ -z "$out" ] || fail "--claude partial Cursor arm payload must be silent: $out"
+  done
+
+  rc=0
+  out=$(printf '%s' '{"tool_name":"Shell","tool_input":{"command":"bin/fm-watch-arm.sh &"}}' \
+    | CURSOR_AGENT=1 "$CHECK" --claude 2>&1) || rc=$?
+  [ "$rc" -eq 2 ] || fail "CURSOR_AGENT alone must not suppress an ordinary Claude deny, got $rc"
+  assert_contains "$out" '[watcher-background]' "ordinary Claude deny lost its concrete reason"
+  pass "arm pre-tool: Claude suppression accepts complete or partial Cursor-versioned objects"
+}
+
+test_cursor_scope_keeps_linked_worker_inert_and_secondmate_active() {
+  local base worker second payload out rc
+  base="$MATRIX_TMP/cursor-scope-base"
+  worker="$MATRIX_TMP/cursor-scope-worker"
+  second="$MATRIX_TMP/cursor-scope-secondmate"
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Shell","tool_input":{"command":"bin/fm-watch-arm.sh &"}}'
+
+  fm_git_worktree "$base" "$worker" fm/cursor-arm-worker
+  mkdir -p "$worker/bin" "$worker/state"
+  : > "$worker/AGENTS.md"
+  cp "$POLICY" "$worker/bin/fm-arm-command-policy.mjs"
+  out=$(printf '%s' "$payload" \
+    | FM_ROOT_OVERRIDE="$worker" FM_HOME="$worker" FM_STATE_OVERRIDE="$worker/state" \
+      "$CHECK" --cursor 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "Cursor arm guard worker no-op must exit 0, got $rc"
+  [ -z "$out" ] || fail "Cursor arm guard fired in a linked worker: $out"
+
+  git -C "$base" worktree add --quiet -b fm/cursor-arm-secondmate "$second"
+  mkdir -p "$second/bin" "$second/state"
+  : > "$second/AGENTS.md"
+  printf 'cursor-arm-sm\n' > "$second/.fm-secondmate-home"
+  cp "$POLICY" "$second/bin/fm-arm-command-policy.mjs"
+  out=$(printf '%s' "$payload" \
+    | FM_ROOT_OVERRIDE="$second" FM_HOME="$second" FM_STATE_OVERRIDE="$second/state" \
+      "$CHECK" --cursor 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "Cursor arm guard secondmate deny must exit 0, got $rc"
+  printf '%s' "$out" | jq -e '.permission == "deny"' >/dev/null 2>&1 \
+    || fail "Cursor arm guard did not activate in a linked secondmate primary: $out"
+  pass "arm pre-tool --cursor: linked worker is inert and linked secondmate primary is active"
+}
+
 # --- harness wiring: each adapter invokes the shared checker -----------------
 
 # --- shellcheck (belt-and-suspenders; CI/CONTRIBUTING.md also runs this) -----
@@ -464,4 +570,8 @@ test_failopen_missing_node
 test_claude_mode_stdout_empty_on_deny
 test_default_mode_stdout_has_grok_json_on_deny
 test_allow_is_silent_both_modes
+test_default_mode_ignores_unrelated_exported_internal_names
+test_cursor_native_deny_and_allow_shapes
+test_cursor_transport_fail_open_and_claude_duplicate_suppression
+test_cursor_scope_keeps_linked_worker_inert_and_secondmate_active
 test_shellcheck_clean

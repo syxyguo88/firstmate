@@ -213,6 +213,31 @@ shift
 
 fm_backend_validate "$TARGET_BACKEND" || exit 1
 
+# Cursor prompts use a raw line protocol, so there is no composer postcondition
+# that could distinguish the bridge from a shell left behind after it exits.
+# On backends with a recovery-grade process classifier, require the exact
+# fm-cursor-acp + ACP-child identity before typing any bytes. Other backends
+# still require a live endpoint; Cursor launches with shell `exec`, so bridge
+# exit cannot reveal a command-accepting shell there.
+fm_send_cursor_bridge_preflight() {
+  [ "$TARGET_HARNESS" = cursor ] || return 0
+  case "$TARGET_BACKEND" in
+    tmux|herdr)
+      CURSOR_AGENT_STATE=$(fm_backend_cursor_agent_state "$TARGET_BACKEND" "$T")
+      if [ "$CURSOR_AGENT_STATE" != alive ]; then
+        echo "error: verified Cursor ACP bridge is not alive at $T (backend=$TARGET_BACKEND state=$CURSOR_AGENT_STATE; tried $RESOLUTION_TRIED)" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      if ! fm_backend_target_exists "$TARGET_BACKEND" "$T" "$EXPECTED_LABEL"; then
+        echo "error: Cursor ACP endpoint is not live at $T (backend=$TARGET_BACKEND; tried $RESOLUTION_TRIED)" >&2
+        exit 1
+      fi
+      ;;
+  esac
+}
+
 # Classify a from-firstmate -> secondmate request. Only a task selector resolved
 # through this home's meta whose authoritative kind is secondmate is marked: the
 # secondmate then routes its reply via the status path (see fm-marker-lib.sh).
@@ -233,13 +258,14 @@ fi
 # unknown and treated as non-codex (the safe default that keeps the fast path).
 # The target's BACKEND comes from selector meta, from matching an explicit target
 # back to recorded meta, or from strict explicit-target shape validation.
-# Do not add a separate passive liveness preflight here. Active send paths own
-# backend readiness: herdr, for example, must route through its session-aware
-# target_ready path before sending, while zellij verifies pane labels in its
-# send implementation. A failed backend send is still surfaced below as a hard
-# error with the attempted resolution attached.
+# Cursor's raw line transport has the explicit bridge preflight above. Other
+# harnesses retain active-send ownership of backend readiness: herdr, for
+# example, routes through its session-aware target_ready path, while zellij
+# verifies pane labels in its send implementation. A failed backend send is
+# still surfaced below as a hard error with the attempted resolution attached.
 
 if [ "${1:-}" = "--key" ]; then
+  fm_send_cursor_bridge_preflight
   if ! fm_backend_send_key "$TARGET_BACKEND" "$T" "$2" "$EXPECTED_LABEL"; then
     echo "error: key '$2' not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
     exit 1
@@ -247,6 +273,15 @@ if [ "${1:-}" = "--key" ]; then
   fm_send_record_interrupt "$2" || exit 1
 else
   MESSAGE=$*
+  if [ "$TARGET_HARNESS" = cursor ]; then
+    case "$MESSAGE" in
+      *$'\n'*|*$'\r'*)
+        echo "error: Cursor input must be exactly one CR/LF-free line; backend was not called and no pending expectation was created" >&2
+        exit 2
+        ;;
+    esac
+    fm_send_cursor_bridge_preflight
+  fi
   if [ "$MARK_FROM_FIRSTMATE" = 1 ]; then
     # Reuse an existing correlation id for recovery resends; otherwise create a
     # durable parent expectation before delivery. Transport success never
@@ -272,50 +307,64 @@ else
       exit 1
     fi
   fi
-  # Slash commands open a completion popup in some TUIs (verified on codex);
-  # submitting too fast selects nothing, so give the popup time to settle before
-  # the (retried) Enter. Codex opens the same kind of popup for a `$<skill>`
-  # invocation, so a `$...` message to a codex target gets the same settle. That
-  # `$` case is scoped to codex on purpose: unlike `/`, a leading `$` commonly
-  # starts ordinary text ("$5/month", "$HOME"), so a universal `$` rule would
-  # needlessly slow plain text to claude/opencode/pi. The target backend's
-  # verified submit retry still backs the settle up either way.
-  case "$*" in
-    /*) settle=1.2 ;;
-    \$*)
-      if [ "$TARGET_HARNESS" = codex ]; then settle=1.2; else settle=0.3; fi
-      ;;
-    *) settle=0.3 ;;
-  esac
-  retries=${FM_SEND_RETRIES:-3}
-  sleep_s=${FM_SEND_SLEEP:-0.4}
-  # Type once, submit, verify. Only exact empty confirms delivery; every other
-  # verdict preserves the loud refusal boundary.
-  if ! verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL"); then
-    if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
-      fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true
+  if [ "$TARGET_HARNESS" = cursor ]; then
+    # ACP stdin is a line protocol. The backend adapter sends exactly one line;
+    # no pane capture/composer classifier participates, and adapter success is
+    # the delivery proof. Never retry here: retrying could duplicate a queued
+    # prompt after an inconclusive terminal transport result.
+    if ! fm_backend_send_text_line "$TARGET_BACKEND" "$T" "$MESSAGE" "$EXPECTED_LABEL"; then
+      # A line adapter may have staged literal text before submission failed.
+      # That ambiguity exists even without pending-reply state, so every Cursor
+      # line failure is a distinct do-not-retry outcome.
+      echo "error: text delivery to $T is unknown ($TARGET_BACKEND line submit failed; tried $RESOLUTION_TRIED); delivery unknown; do not resend." >&2
+      exit 3
     fi
-    echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
-    exit 1
-  fi
-  case "$verdict" in
-    empty)
-      ;;
-    send-failed)
+  else
+    # Slash commands open a completion popup in some TUIs (verified on codex);
+    # submitting too fast selects nothing, so give the popup time to settle before
+    # the (retried) Enter. Codex opens the same kind of popup for a `$<skill>`
+    # invocation, so a `$...` message to a codex target gets the same settle. That
+    # `$` case is scoped to codex on purpose: unlike `/`, a leading `$` commonly
+    # starts ordinary text ("$5/month", "$HOME"), so a universal `$` rule would
+    # needlessly slow plain text to claude/opencode/pi. The target backend's
+    # verified submit retry still backs the settle up either way.
+    case "$*" in
+      /*) settle=1.2 ;;
+      \$*)
+        if [ "$TARGET_HARNESS" = codex ]; then settle=1.2; else settle=0.3; fi
+        ;;
+      *) settle=0.3 ;;
+    esac
+    retries=${FM_SEND_RETRIES:-3}
+    sleep_s=${FM_SEND_SLEEP:-0.4}
+    # Type once, submit, verify. Only exact empty confirms delivery; every other
+    # verdict preserves the loud refusal boundary.
+    if ! verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL"); then
       if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
         fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true
       fi
       echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
       exit 1
-      ;;
-    *)
-      if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
-        fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true
-      fi
-      echo "error: text not submitted to $T (delivery unconfirmed; verdict=${verdict:-unknown}; tried $RESOLUTION_TRIED)" >&2
-      exit 1
-      ;;
-  esac
+    fi
+    case "$verdict" in
+      empty)
+        ;;
+      send-failed)
+        if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
+          fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true
+        fi
+        echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
+        exit 1
+        ;;
+      *)
+        if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
+          fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true
+        fi
+        echo "error: text not submitted to $T (delivery unconfirmed; verdict=${verdict:-unknown}; tried $RESOLUTION_TRIED)" >&2
+        exit 1
+        ;;
+    esac
+  fi
   # Delivery confirmed. Mark the pending expectation delivered without resolving
   # it: only a correlated parent report acknowledges the request.
   if [ -n "$PENDING_REPLY_CORR" ]; then

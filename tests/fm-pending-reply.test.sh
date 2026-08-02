@@ -54,19 +54,37 @@ case "${1:-}" in
         *) break ;;
       esac
     done
+    if [ "$literal" = 0 ] && [ "${1:-}" = Enter ] \
+      && [ "${FM_FAKE_TMUX_FAIL_ENTER:-0}" = 1 ]; then
+      exit 1
+    fi
     if [ "$literal" = 1 ]; then
       printf '%s' "${1:-}" >> "$FM_SEND_LOG"
     fi
     exit 0 ;;
   display-message)
-    for a in "$@"; do case "$a" in *cursor_y*) printf '1\n'; exit 0 ;; esac; done
+    for a in "$@"; do
+      case "$a" in
+        *cursor_y*) printf '1\n'; exit 0 ;;
+        *pane_current_command*) printf 'fm-cursor-acp\n'; exit 0 ;;
+        *pane_pid*) printf '400\n'; exit 0 ;;
+      esac
+    done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '╭────╮\n│    │\n╰────╯\n'; exit 0 ;;
-  list-windows) exit 0 ;;
+  list-windows) printf 'fm-hibit\n'; exit 0 ;;
 esac
 exit 0
 SH
   chmod +x "$fb/tmux"
+  cat > "$fb/ps" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' \
+  '400 1 zsh zsh' \
+  '410 400 fm-cursor-acp fm-cursor-acp' \
+  '411 410 agent agent --trust --force acp'
+SH
+  chmod +x "$fb/ps"
   cat > "$fb/sleep" <<'SH'
 #!/usr/bin/env bash
 exit 0
@@ -230,6 +248,39 @@ test_recovery_attempt_is_never_reinjected() {
   [ "$lines" = 1 ] || fail "reconciliation must not call recovery transport, got $lines attempts"
   unset FM_PENDING_REPLY_SEND_HOOK
   pass "recovery attempts reconcile without reinjection"
+}
+
+test_cursor_recovery_partial_send_is_delivery_unknown() {
+  local home state dir fb log corr rec rc old_path
+  dir="$TMP_ROOT/recovery-unknown"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  home=$(setup_parent recovery-unknown)
+  state="$home/state"
+  fm_write_meta "$state/hibit.meta" \
+    "window=sess:fm-hibit" "harness=cursor" "kind=secondmate" "home=$home/sm"
+  corr=$(fm_pending_reply_create "$home" "$state" hibit "recover partial cursor line")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  fm_pending_reply_mark_turn_completed "$state" "$corr" request
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  old_path=$PATH
+  unset FM_PENDING_REPLY_SEND_HOOK
+  export PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_SEND_LOG="$log"
+  export FM_FAKE_TMUX_FAIL_ENTER=1
+  set +e
+  fm_pending_reply_send_recovery "$state" "$corr"
+  rc=$?
+  set -e
+  PATH=$old_path
+  export PATH
+  unset FM_FAKE_TMUX_FAIL_ENTER FM_ROOT_OVERRIDE FM_SEND_LOG
+  [ "$rc" -ne 0 ] || fail "unknown Cursor recovery delivery was reported confirmed"
+  [ "$(phase_of "$state" "$corr")" = recovery_unknown ] \
+    || fail "Cursor recovery rc=3 must finish as recovery_unknown"
+  [ "$(fm_pending_reply_get "$rec" recovery_delivery_outcome)" = unknown ] \
+    || fail "Cursor recovery rc=3 lost its unknown delivery outcome"
+  [ -z "$(fm_pending_reply_get "$rec" recovery_sent_epoch)" ] \
+    || fail "unknown Cursor recovery delivery recorded a sent epoch"
+  pass "Cursor recovery preserves fm-send rc=3 as durable recovery_unknown"
 }
 
 test_recovery_reply_resolves_original() {
@@ -910,6 +961,7 @@ test_failed_send_discards_undelivered_expectation() {
 test_normal_correlated_reply_resolves_once
 test_completed_turn_no_report_triggers_one_recovery
 test_recovery_attempt_is_never_reinjected
+test_cursor_recovery_partial_send_is_delivery_unknown
 test_recovery_reply_resolves_original
 test_second_missed_turn_escalates_once_and_stays_durable
 test_escalation_publication_failure_retries

@@ -145,9 +145,11 @@ if [ -z "$BUSY_GEN" ]; then
 fi
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
+CURSOR_ORCA_REMOVAL_CONFIRMED=0
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
+HARNESS=$(fm_meta_get "$META" harness)
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 PUBLIC_FOLLOWUP_HOME=$FM_HOME
@@ -234,6 +236,20 @@ default_branch() {
 meta_value() {
   local meta=$1 key=$2
   fm_meta_get "$meta" "$key"
+}
+
+cursor_endpoint_confirmed_gone() {  # <backend> <target>
+  local backend=$1 target=$2 attempt=1 attempts
+  attempts=${FM_CURSOR_TEARDOWN_CONFIRM_ATTEMPTS:-30}
+  case "$attempts" in ''|*[!0-9]*|0) attempts=30 ;; esac
+  while [ "$attempt" -le "$attempts" ]; do
+    if fm_backend_endpoint_confirmed_gone "$backend" "$target" 2>/dev/null; then
+      return 0
+    fi
+    [ "$attempt" -ge "$attempts" ] || sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  return 1
 }
 
 require_orca_worktree_id() {
@@ -1355,7 +1371,7 @@ preflight_firstmate_home_herdr_children() {  # <home>
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_harness child_orca_worktree_id child_return_rc child_busy_gen
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -1366,6 +1382,7 @@ cleanup_firstmate_home_children() {
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
     child_backend=$(fm_backend_of_meta "$child_meta")
+    child_harness=$(meta_value "$child_meta" harness)
     if [ "$child_backend" = orca ]; then
       child_t=$(meta_value "$child_meta" terminal)
     else
@@ -1395,6 +1412,22 @@ cleanup_firstmate_home_children() {
         ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" ) 2>/dev/null || true
       else
         fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" 2>/dev/null || true
+      fi
+      if [ "$child_harness" = cursor ] \
+         && [ "$child_backend" != herdr ] \
+         && [ "$child_backend" != orca ]; then
+        if [ "$child_backend" = zellij ]; then
+          if ! ( unset FM_ROOT_OVERRIDE
+            FM_HOME=$home FM_ROOT=$home \
+              cursor_endpoint_confirmed_gone "$child_backend" "$child_t"
+          ); then
+            echo "error: Cursor ACP endpoint $child_t for child $child_id is not confirmed gone; retaining that child's durable identity records and stopping forced cleanup" >&2
+            return 1
+          fi
+        elif ! cursor_endpoint_confirmed_gone "$child_backend" "$child_t"; then
+          echo "error: Cursor ACP endpoint $child_t for child $child_id is not confirmed gone; retaining that child's durable identity records and stopping forced cleanup" >&2
+          return 1
+        fi
       fi
     fi
     if [ "$child_kind" = secondmate ]; then
@@ -1440,7 +1473,9 @@ cleanup_firstmate_home_children() {
     retire_busy_state "$sub_state" "$child_id" "$child_busy_gen" || return 1
     rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" \
       "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" \
-      "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.kimi-turnend-token"
+      "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.kimi-turnend-token" \
+      "$sub_state/$child_id.cursor-session.json" \
+      "$sub_state/$child_id.cursor-session.json.tmp."*
   done
 }
 
@@ -1581,7 +1616,11 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
       "$WT/.fm-grok-turnend" "$WT/.fm-kimi-turnend"
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
-  fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
+  if ! fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"; then
+    echo "error: Orca worktree removal failed for $ID; retaining every durable task record" >&2
+    exit 1
+  fi
+  [ "$HARNESS" != cursor ] || CURSOR_ORCA_REMOVAL_CONFIRMED=1
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
@@ -1672,6 +1711,13 @@ if [ "$BACKEND" = herdr ]; then
     exit 1
   fi
 fi
+if [ "$HARNESS" = cursor ] && [ "$BACKEND" != herdr ]; then
+  if { [ "$BACKEND" = orca ] && [ "$CURSOR_ORCA_REMOVAL_CONFIRMED" != 1 ]; } \
+     || { [ "$BACKEND" != orca ] && ! cursor_endpoint_confirmed_gone "$BACKEND" "$T"; }; then
+    echo "error: Cursor ACP endpoint $T for $ID is not confirmed gone; retaining every durable task record - rerun teardown once endpoint closure can be verified" >&2
+    exit 1
+  fi
+fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?
@@ -1687,7 +1733,8 @@ remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
-  "$STATE/$ID.kimi-turnend-token"
+  "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.cursor-session.json" \
+  "$STATE/$ID.cursor-session.json.tmp."*
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

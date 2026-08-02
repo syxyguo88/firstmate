@@ -63,9 +63,19 @@ EPOCH="$STATE/.claude-autoarm-epoch"
 # shellcheck source=bin/fm-session-lock-lib.sh
 . "$SCRIPT_DIR/fm-session-lock-lib.sh"
 
-# Consume the Stop payload once. The decisions below are state-based; the
-# payload is read so a slow writer can never wedge on a full pipe.
-cat >/dev/null 2>&1 || true
+# Consume and retain the Stop payload once so Cursor's third-party Claude hook
+# compatibility cannot start the Claude-owned auto-arm for any Cursor-versioned
+# object, including a partially damaged event. Without jq, or for every ordinary
+# Claude payload, preserve the established state-based behavior below.
+PAYLOAD=$(cat 2>/dev/null || true)
+if command -v jq >/dev/null 2>&1; then
+  if printf '%s' "$PAYLOAD" | jq -e '
+    type == "object"
+    and (.cursor_version | type == "string" and length > 0)
+  ' >/dev/null 2>&1; then
+    exit 0
+  fi
+fi
 
 # --- scope: genuine primary checkout only -----------------------------------
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0

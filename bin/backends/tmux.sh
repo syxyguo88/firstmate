@@ -148,6 +148,107 @@ fm_backend_tmux_current_command() {  # <target>
   tmux display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null
 }
 
+# Prove the exact bridge/direct-child relationship from the pane process tree.
+# Accepted child surfaces are the direct test/installed `agent` executable and
+# Cursor's real exec-a Node form (`comm=node`, argv0=agent, versioned
+# cursor-agent index.js). A bridge title without that child, or a generic
+# agent/node/Cursor GUI process, is never sufficient.
+fm_backend_tmux_cursor_acp_child_alive() {  # <target>
+  local pane_pid
+  pane_pid=$(tmux display-message -p -t "$1" '#{pane_pid}' 2>/dev/null) || return 1
+  case "$pane_pid" in ''|*[!0-9]*) return 1 ;; esac
+  ps -axo pid=,ppid=,comm=,args= 2>/dev/null | awk -v pane="$pane_pid" '
+    function descendant(pid, root, depth) {
+      for (depth = 0; depth < 32 && pid != ""; depth++) {
+        if (pid == root) return 1
+        pid = parent[pid]
+      }
+      return 0
+    }
+    function strip_agent_argv0(args) {
+      if (args !~ /^(agent|[^[:space:]]*\/agent)[[:space:]]+/) return ""
+      sub(/^(agent|[^[:space:]]*\/agent)[[:space:]]+/, "", args)
+      return args
+    }
+    # ps flattens argv, so model word boundaries cannot be recovered here.
+    # Require the exact fixed option prefix and terminal acp token, retain at
+    # least one nonblank model character, and reject an option-shaped first
+    # model token (the bridge itself refuses --prefixed option values).
+    function valid_acp_tail(tail, model) {
+      if (tail ~ /^--trust[[:space:]]+--force[[:space:]]+acp[[:space:]]*$/) return 1
+      if (tail !~ /^--trust[[:space:]]+--force[[:space:]]+--model[[:space:]]+/) return 0
+      model = tail
+      sub(/^--trust[[:space:]]+--force[[:space:]]+--model[[:space:]]+/, "", model)
+      if (model !~ /[[:space:]]+acp[[:space:]]*$/) return 0
+      sub(/[[:space:]]+acp[[:space:]]*$/, "", model)
+      if (model !~ /[^[:space:]]/) return 0
+      if (model ~ /^--[^[:space:]]*([[:space:]]|$)/) return 0
+      return 1
+    }
+    function valid_official_agent(args, path_token) {
+      args = strip_agent_argv0(args)
+      if (args == "") return 0
+      sub(/^--use-system-ca[[:space:]]+/, "", args)
+      path_token = args
+      sub(/[[:space:]].*$/, "", path_token)
+      if (path_token !~ /\/cursor-agent\/versions\/[^\/[:space:]]+\/index\.js$/) return 0
+      sub(/^[^[:space:]]+[[:space:]]+/, "", args)
+      return valid_acp_tail(args)
+    }
+    {
+      pid = $1
+      parent[pid] = $2
+      command[pid] = $3
+      sub(/^.*\//, "", command[pid])
+      $1 = $2 = $3 = ""
+      sub(/^[[:space:]]+/, "", $0)
+      arguments[pid] = $0
+    }
+    END {
+      for (bridge in command) {
+        if (command[bridge] != "fm-cursor-acp" || !descendant(bridge, pane)) continue
+        for (child in command) {
+          if (parent[child] != bridge) continue
+          if (command[child] == "agent") {
+            if (valid_acp_tail(strip_agent_argv0(arguments[child]))) {
+              found = 1
+            }
+          }
+          if (command[child] == "node" || command[child] == "nodejs") {
+            if (valid_official_agent(arguments[child])) {
+              found = 1
+            }
+          }
+        }
+      }
+      exit(found ? 0 : 1)
+    }
+  '
+}
+
+# Cursor-only send identity. Unlike the generic recovery classifier, this never
+# treats another recognized harness as sufficient: the pane foreground command
+# must be the bridge title and that bridge must own one constrained ACP child.
+fm_backend_tmux_cursor_agent_state() {  # <target>
+  local target=$1 state comm
+  state=$(fm_backend_tmux_agent_state "$target")
+  case "$state" in
+    missing|unreadable) printf '%s' "$state"; return 0 ;;
+  esac
+  comm=$(fm_backend_tmux_current_command "$target" 2>/dev/null) || {
+    printf 'unreadable'
+    return 0
+  }
+  comm=${comm#-}
+  if [ "$comm" = fm-cursor-acp ] && fm_backend_tmux_cursor_acp_child_alive "$target"; then
+    printf 'alive'
+  elif [ "$state" = dead ]; then
+    printf 'dead'
+  else
+    printf 'ambiguous'
+  fi
+}
+
 # fm_backend_tmux_agent_state: recovery-grade harness-agent state for one
 # recorded target. See bin/fm-backend.sh's fm_backend_agent_state for the
 # shared state vocabulary and docs/tmux-backend.md "Agent liveness probe" for
@@ -193,6 +294,13 @@ fm_backend_tmux_agent_state() {  # <target>
   }
   comm=${comm#-}
   case "$comm" in
+    fm-cursor-acp|agent|node|nodejs)
+      if fm_backend_tmux_cursor_acp_child_alive "$target"; then
+        printf 'alive'
+      else
+        printf 'ambiguous'
+      fi
+      ;;
     *claude*|*codex*|*opencode*|*grok*|*kimi*|pi|pi-signed|pi-launcher|Pi) printf 'alive' ;;
     zsh|bash|sh|dash|ash|ksh|mksh|tcsh|csh|fish) printf 'dead' ;;
     '') printf 'unreadable' ;;

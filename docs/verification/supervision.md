@@ -54,6 +54,7 @@ Current deterministic and live entry points:
 tests/fm-sessionstart-nudge.test.sh
 FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh
 FM_OPENCODE_LIVE_E2E=1 tests/fm-opencode-primary-live-e2e.test.sh
+FM_CURSOR_LIVE_E2E=1 tests/fm-cursor-primary-live-e2e.test.sh
 ```
 
 The Ahoy first-message boundary was reverified on 2026-07-22 with Pi 0.81.1 and OpenCode 1.17.18.
@@ -73,6 +74,14 @@ Each pass polled `state/<id>.busy-state` while a real turn ran.
 | Codex | codex-cli 0.145.0 | None usable | See below; classifies `unknown codex-unverified`. |
 | Kimi (standalone) | not installed | None usable | No binary on `PATH`, so the gate stays closed and it classifies `unknown kimi-unverified`. |
 | Grok | 0.2.112 | Isolated rendered-tail fallback | Retained unconverted; the approved audit could not credit a live structured-lifecycle run. |
+
+Cursor's `cursor-acp` source was added after the 2026-07-28 live matrix.
+`tests/fm-cursor-acp-bridge.test.sh` deterministically validates prompt start,
+validated prompt stop, cancellation, and protocol/process failure transitions
+against a fake ACP server. The credentialed
+`FM_CURSOR_LIVE_E2E=1 tests/fm-cursor-acp-live-e2e.test.sh` gate is the
+maintainer entry point for promoting that contract to version-scoped live
+evidence; its existence is not recorded here as a completed paid model run.
 
 Codex was probed two ways, both refused:
 
@@ -150,6 +159,7 @@ tests/fm-turnend-guard.test.sh
 tests/fm-supervision-instructions.test.sh
 FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh
 FM_GROK_STOP_LIVE_E2E=1 FM_GROK_NATIVE_BIN="$native_grok" FM_GROK_LEGACY_BIN="$pre_native_grok" tests/fm-grok-stop-live-e2e.test.sh
+FM_CURSOR_LIVE_E2E=1 tests/fm-cursor-primary-live-e2e.test.sh
 ```
 
 ## Watcher continuity

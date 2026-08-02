@@ -281,6 +281,25 @@ fm_backend_zellij_pane_exists() {  # <session> <pane_id>
     | jq -e --argjson p "$pane_id" '[.[]? | select(.id == $p and .is_plugin == false)] | length > 0' >/dev/null 2>&1
 }
 
+# Durable-cleanup proof: only a successfully parsed pane inventory that omits
+# the exact numeric pane is authoritative absence. CLI errors and malformed
+# JSON remain ambiguity and must preserve recovery state.
+fm_backend_zellij_endpoint_confirmed_gone() {  # <target>
+  local out
+  fm_backend_zellij_parse_target "$1" || return 1
+  out=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-panes --json 2>/dev/null) \
+    || return 1
+  printf '%s' "$out" | jq -e --argjson p "$FM_BACKEND_ZELLIJ_PANE" '
+    type == "array"
+    and all(.[];
+      (.id | type) == "number"
+      and (.tab_id | type) == "number"
+      and (.is_plugin | type) == "boolean"
+    )
+    and ([.[]? | select(.id == $p and .is_plugin == false)] | length == 0)
+  ' >/dev/null 2>&1
+}
+
 # fm_backend_zellij_tab_matches_label: does <tab_id> in <session> carry the
 # tab name firstmate expects for the caller-facing task label <label>?
 # Checks the home-scoped, tagged title first (fm_backend_zellij_scoped_title

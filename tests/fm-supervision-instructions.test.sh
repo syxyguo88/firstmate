@@ -131,6 +131,40 @@ test_pi_signed_preserves_identity_with_pi_supervision_protocol() {
   pass "pi-signed keeps its identity while sharing Pi's supervision protocol"
 }
 
+test_cursor_managed_background_protocol() {
+  local out ordinary repair
+  out=$("$RENDER" --harness cursor)
+  assert_contains "$out" "SUPERVISION OPERATING INSTRUCTIONS - primary harness: cursor" \
+    "Cursor heading was normalized to unknown"
+  assert_contains "$out" "Mode: Cursor managed background completion supervision." \
+    "Cursor protocol snippet is missing"
+  assert_contains "$out" "Cursor Shell tool" \
+    "Cursor protocol does not name the native Shell tool"
+  assert_contains "$out" "long-running \`bin/fm-watch-arm.sh\`" \
+    "Cursor protocol lost the standalone long-running arm task"
+  assert_contains "$out" "managed background completion notification" \
+    "Cursor protocol lost its ordinary wake mechanism"
+  assert_contains "$out" "Stop hook is the final backstop" \
+    "Cursor protocol lost the bounded Stop backstop"
+  assert_not_contains "$out" "shell \`&\`" \
+    "Cursor protocol must never instruct shell backgrounding"
+
+  ordinary=$(printf '%s\n' "$out" | grep -F -- '- Ordinary wake:')
+  assert_contains "$ordinary" "drain and handle" \
+    "Cursor ordinary wake does not start with drain and handling"
+  assert_contains "$ordinary" "start exactly one new cycle" \
+    "Cursor ordinary wake does not restart supervision when still needed"
+
+  repair=$("$RENDER" --harness cursor --repair-line)
+  assert_contains "$repair" "Cursor managed background Shell task" \
+    "Cursor repair line lost native managed background ownership"
+  assert_contains "$repair" "bin/fm-watch-arm.sh" \
+    "Cursor repair line lost the arm command"
+  assert_contains "$repair" "never shell &" \
+    "Cursor repair line does not forbid shell backgrounding"
+  pass "renderer: Cursor uses managed background completion, ordinary-cycle restart, and Stop backstop"
+}
+
 test_grok_is_background_notify() {
   local out
   out=$("$RENDER" --harness grok)
@@ -177,6 +211,7 @@ test_conditional_stanzas
 test_repair_lines
 test_cross_harness_ordinary_continuation_and_repair_matrix
 test_pi_signed_preserves_identity_with_pi_supervision_protocol
+test_cursor_managed_background_protocol
 test_grok_is_background_notify
 test_grok_command_sources_effective_config
 test_pi_snippet_uses_effective_extension_path

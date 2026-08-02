@@ -1647,6 +1647,103 @@ fm_backend_herdr_explicit_close_pane_confirmed() {  # <session> <pane_id>
 #              change as "the pane exists"). The caller must fail safe toward
 #              refusal here, never toward closing - this is the conservative
 #              backstop the husk check depends on.
+#
+# Herdr's verified process-info surface reports the pane foreground identity,
+# not the bridge-owned pipe child process tree. For an unregistered Cursor ACP
+# pane, exact name+argv0 `fm-cursor-acp` is therefore the strongest available
+# positive surface; do not guess at child status from generic agent/node names.
+fm_backend_herdr_cursor_bridge_live() {  # <session> <pane_id>
+  local session=$1 pane_id=$2 out
+  out=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane_id" 2>/dev/null) || return 1
+  printf '%s' "$out" | jq -e --arg pane "$pane_id" '
+    .result.type == "pane_process_info"
+    and .result.process_info.pane_id == $pane
+    and any(
+      .result.process_info.foreground_processes[]?;
+      .name == "fm-cursor-acp"
+      and ((.argv0 // .argv[0] // "") == "fm-cursor-acp")
+    )
+  ' >/dev/null 2>&1
+}
+
+fm_backend_herdr_cursor_bridge_child_alive() {  # <session> <pane_id>
+  local session=$1 pane_id=$2 info bridge_pid rows ps_bin
+  info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane_id" 2>/dev/null) \
+    || return 1
+  bridge_pid=$(printf '%s' "$info" | jq -er --arg pane "$pane_id" '
+    .result.process_info as $info
+    | select(
+      .result.type == "pane_process_info"
+      and $info.pane_id == $pane
+      and ($info.foreground_processes | type) == "array"
+      and ($info.foreground_processes | length) == 1
+      and $info.foreground_processes[0].name == "fm-cursor-acp"
+      and (
+        (
+          $info.foreground_processes[0].argv0
+          // $info.foreground_processes[0].argv[0]
+          // ""
+        ) == "fm-cursor-acp"
+      )
+    )
+    | $info.foreground_processes[0].pid
+    | select(type == "number" and . > 1)
+    | floor
+  ' 2>/dev/null) || return 1
+  ps_bin=${FM_HERDR_PS_BIN:-ps}
+  command -v "$ps_bin" >/dev/null 2>&1 || return 1
+  rows=$("$ps_bin" -axo pid=,ppid=,comm=,args= 2>/dev/null) || return 1
+  printf '%s\n' "$rows" | awk -v bridge="$bridge_pid" '
+    function strip_agent_argv0(args) {
+      if (args !~ /^(agent|[^[:space:]]*\/agent)[[:space:]]+/) return ""
+      sub(/^(agent|[^[:space:]]*\/agent)[[:space:]]+/, "", args)
+      return args
+    }
+    function valid_acp_tail(tail, model) {
+      if (tail ~ /^--trust[[:space:]]+--force[[:space:]]+acp[[:space:]]*$/) return 1
+      if (tail !~ /^--trust[[:space:]]+--force[[:space:]]+--model[[:space:]]+/) return 0
+      model = tail
+      sub(/^--trust[[:space:]]+--force[[:space:]]+--model[[:space:]]+/, "", model)
+      if (model !~ /[[:space:]]+acp[[:space:]]*$/) return 0
+      sub(/[[:space:]]+acp[[:space:]]*$/, "", model)
+      if (model !~ /[^[:space:]]/ || model ~ /^--[^[:space:]]*([[:space:]]|$)/) return 0
+      return 1
+    }
+    function valid_official_agent(args, path_token) {
+      args = strip_agent_argv0(args)
+      if (args == "") return 0
+      sub(/^--use-system-ca[[:space:]]+/, "", args)
+      path_token = args
+      sub(/[[:space:]].*$/, "", path_token)
+      if (path_token !~ /\/cursor-agent\/versions\/[^\/[:space:]]+\/index\.js$/) return 0
+      sub(/^[^[:space:]]+[[:space:]]+/, "", args)
+      return valid_acp_tail(args)
+    }
+    {
+      pid = $1
+      parent[pid] = $2
+      command[pid] = $3
+      sub(/^.*\//, "", command[pid])
+      $1 = $2 = $3 = ""
+      sub(/^[[:space:]]+/, "", $0)
+      arguments[pid] = $0
+    }
+    END {
+      if (command[bridge] != "fm-cursor-acp") exit 1
+      for (pid in command) {
+        if (parent[pid] != bridge) continue
+        if (command[pid] == "agent" && valid_acp_tail(strip_agent_argv0(arguments[pid]))) {
+          found = 1
+        }
+        if ((command[pid] == "node" || command[pid] == "nodejs") && valid_official_agent(arguments[pid])) {
+          found = 1
+        }
+      }
+      exit(found ? 0 : 1)
+    }
+  '
+}
+
 fm_backend_herdr_pane_agent_state() {  # <session> <pane_id>
   local session=$1 pane_id=$2 out code presence status
   presence=$(fm_backend_herdr_pane_presence_state "$session" "$pane_id")
@@ -1688,12 +1785,41 @@ fm_backend_herdr_tab_is_husk() {  # <session> <pane_id>
 # a confirmed agent-less pane is `dead`, a registered agent is `alive`, and an
 # unexpected or failed API read is `unreadable`.
 fm_backend_herdr_agent_state() {  # <target>
-  local target=$1
+  local target=$1 pane_state
   fm_backend_herdr_parse_target "$target" || { printf 'unreadable'; return 0; }
-  case "$(fm_backend_herdr_pane_agent_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" in
+  pane_state=$(fm_backend_herdr_pane_agent_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
+  case "$pane_state" in
     dead) printf 'missing' ;;
-    no-agent) printf 'dead' ;;
+    no-agent)
+      if fm_backend_herdr_cursor_bridge_live "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE"; then
+        printf 'alive'
+      else
+        printf 'dead'
+      fi
+      ;;
     live) printf 'alive' ;;
+    *) printf 'unreadable' ;;
+  esac
+}
+
+# Cursor-only send identity. A registered Claude/Codex/etc. agent is not a
+# Cursor worker. Cursor ACP itself is intentionally unregistered in Herdr, so
+# require the exact foreground bridge PID on an otherwise agent-less pane and
+# prove its constrained direct ACP child through the local process table.
+fm_backend_herdr_cursor_agent_state() {  # <target>
+  local target=$1 pane_state
+  fm_backend_herdr_parse_target "$target" || { printf 'unreadable'; return 0; }
+  pane_state=$(fm_backend_herdr_pane_agent_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
+  case "$pane_state" in
+    dead) printf 'missing' ;;
+    no-agent)
+      if fm_backend_herdr_cursor_bridge_child_alive "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE"; then
+        printf 'alive'
+      else
+        printf 'unreadable'
+      fi
+      ;;
+    live) printf 'ambiguous' ;;
     *) printf 'unreadable' ;;
   esac
 }

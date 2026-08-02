@@ -577,6 +577,185 @@ test_hook_runs_fast() {
   pass "fm-turnend-guard: runs well under the generous timing margin (${elapsed_s}s)"
 }
 
+run_hook_cursor_payload() {
+  local dir=$1 payload=$2 home
+  home=$(cd "$dir" && pwd)
+  printf '%s' "$payload" | FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" --cursor 2>&1
+}
+
+test_hook_cursor_native_followup_and_x_mode_need() {
+  local dir home out status payload message body expected_repair prefix
+  dir=$(make_primary_dir "$TMP_ROOT/hook-cursor-followup")
+  home=$(cd "$dir" && pwd)
+  : > "$dir/state/x-watch.check.sh"
+  mkdir -p "$dir/config"
+  printf 'FM_X_POLL_SECONDS=17\n' > "$dir/config/x-mode.env"
+  payload='{"hook_event_name":"stop","cursor_version":"2.1.0","status":"completed","loop_count":0}'
+  out=$(run_hook_cursor_payload "$dir" "$payload"); status=$?
+  expect_code 0 "$status" "Cursor stop guard must return follow-up JSON with exit 0"
+  message=$(printf '%s' "$out" | jq -er 'select(keys == ["followup_message"]) | .followup_message') \
+    || fail "Cursor stop follow-up must contain only followup_message: $out"
+  prefix=$'\xE2\x81\xA3FIRSTMATE_OP: v1 turn-end-guard: '
+  case "$message" in
+    "$prefix"*) ;;
+    *) fail "Cursor stop follow-up is not a typed turn-end-guard operational input: $message" ;;
+  esac
+  body=$(printf '%s' "$message" | "$dir/bin/fm-operational-input.sh" body) \
+    || fail "Cursor stop follow-up did not decode through fm-operational-input.sh"
+  expected_repair=$(FM_HOME="$home" "$dir/bin/fm-supervision-instructions.sh" \
+    --harness cursor --x-mode 1 --repair-line)
+  case "$body" in
+    "Run bin/fm-wake-drain.sh first. $expected_repair"*) ;;
+    *) fail "Cursor X-mode follow-up must drain then use the renderer-owned repair line (expected: $expected_repair; actual: $body)" ;;
+  esac
+  assert_contains "$body" "source '$home/config/x-mode.env' first, then repair missing watcher supervision with bin/fm-watch-arm.sh" \
+    "Cursor X-mode follow-up lost the exact config source path and arm instruction"
+  [ ! -e "$dir/state/.claude-autoarm.lock" ] || fail "Cursor stop guard created a Claude auto-arm lock"
+  [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "Cursor stop guard created a Claude auto-arm epoch"
+  [ ! -e "$dir/state/.turnend-claude-blocks" ] || fail "Cursor stop guard consumed the Claude block budget"
+  pass "fm-turnend-guard --cursor: typed X-mode follow-up uses the renderer-owned repair line"
+}
+
+test_hook_cursor_status_semantics() {
+  local dir payload out status message prefix hook_status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-cursor-status")
+  : > "$dir/state/task.meta"
+  prefix=$'\xE2\x81\xA3FIRSTMATE_OP: v1 turn-end-guard: '
+
+  payload='{"hook_event_name":"stop","cursor_version":"2.1.0","status":"aborted","loop_count":0}'
+  out=$(run_hook_cursor_payload "$dir" "$payload"); status=$?
+  expect_code 0 "$status" "aborted Cursor stop must allow"
+  [ -z "$out" ] || fail "aborted Cursor stop must not request a follow-up: $out"
+
+  for hook_status in completed error; do
+    payload=$(jq -cn --arg status "$hook_status" \
+      '{hook_event_name:"stop",cursor_version:"2.1.0",status:$status,loop_count:0}')
+    out=$(run_hook_cursor_payload "$dir" "$payload"); status=$?
+    expect_code 0 "$status" "$hook_status Cursor stop follow-up must use native exit 0"
+    message=$(printf '%s' "$out" | jq -er '.followup_message') \
+      || fail "$hook_status Cursor stop did not return follow-up JSON: $out"
+    case "$message" in
+      "$prefix"*) ;;
+      *) fail "$hook_status Cursor stop follow-up was not typed operational input: $message" ;;
+    esac
+  done
+  pass "fm-turnend-guard --cursor: aborted is silent while completed and error repair unhealthy supervision"
+}
+
+test_hook_cursor_afk_followup_stays_away_specific() {
+  local dir payload out status message body
+  dir=$(make_primary_dir "$TMP_ROOT/hook-cursor-afk")
+  : > "$dir/state/task.meta"
+  : > "$dir/state/.afk"
+  payload='{"hook_event_name":"stop","cursor_version":"2.1.0","status":"completed","loop_count":0}'
+  out=$(run_hook_cursor_payload "$dir" "$payload"); status=$?
+  expect_code 0 "$status" "AFK Cursor stop follow-up must use native exit 0"
+  message=$(printf '%s' "$out" | jq -er '.followup_message') \
+    || fail "AFK Cursor stop did not return follow-up JSON: $out"
+  body=$(printf '%s' "$message" | "$dir/bin/fm-operational-input.sh" body) \
+    || fail "AFK Cursor follow-up did not decode as typed operational input"
+  case "$body" in
+    "Run bin/fm-wake-drain.sh first. Away mode owns supervision;"*) ;;
+    *) fail "AFK Cursor follow-up lost its away-specific instruction: $body" ;;
+  esac
+  assert_not_contains "$body" "Cursor managed background Shell task" \
+    "AFK Cursor follow-up must not start normal watcher supervision"
+  pass "fm-turnend-guard --cursor: AFK keeps the typed away-specific repair path"
+}
+
+test_hook_cursor_idle_and_healthy_are_silent() {
+  local dir out status payload pid identity
+  payload='{"hook_event_name":"stop","cursor_version":"2.1.0","status":"completed","loop_count":0}'
+  dir=$(make_primary_dir "$TMP_ROOT/hook-cursor-idle")
+  out=$(run_hook_cursor_payload "$dir" "$payload"); status=$?
+  expect_code 0 "$status" "idle Cursor stop must allow"
+  [ -z "$out" ] || fail "idle Cursor stop produced output: $out"
+
+  dir=$(make_primary_dir "$TMP_ROOT/hook-cursor-healthy")
+  : > "$dir/state/task.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify Cursor fixture watcher"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook_cursor_payload "$dir" "$payload"); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "healthy Cursor stop must allow"
+  [ -z "$out" ] || fail "healthy Cursor stop produced output: $out"
+  pass "fm-turnend-guard --cursor: idle and healthy primary stops stay silent"
+}
+
+test_hook_cursor_malformed_and_wrong_event_fail_open() {
+  local dir payload out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-cursor-invalid")
+  : > "$dir/state/task.meta"
+  for payload in \
+    '{not-json' \
+    '{}' \
+    '{"hook_event_name":"Stop","cursor_version":"2.1.0","status":"completed","loop_count":0}' \
+    '{"hook_event_name":"stop","cursor_version":"2.1.0","status":"done","loop_count":0}' \
+    '{"hook_event_name":"stop","cursor_version":"2.1.0","status":"completed","loop_count":-1}' \
+    '{"hook_event_name":"stop","cursor_version":"2.1.0","status":"completed","loop_count":"0"}'
+  do
+    out=$(run_hook_cursor_payload "$dir" "$payload"); status=$?
+    expect_code 0 "$status" "invalid Cursor stop payload must fail open"
+    [ -z "$out" ] || fail "invalid Cursor stop payload produced output: $out"
+  done
+  pass "fm-turnend-guard --cursor: malformed, wrong-event, and invalidly typed stops fail open"
+}
+
+test_hook_cursor_scope_worker_inert_secondmate_active() {
+  local base worker second payload out status
+  base="$TMP_ROOT/hook-cursor-scope-base"
+  worker="$TMP_ROOT/hook-cursor-scope-worker"
+  second="$TMP_ROOT/hook-cursor-scope-secondmate"
+  payload='{"hook_event_name":"stop","cursor_version":"2.1.0","status":"completed","loop_count":1}'
+
+  make_crewmate_worktree_dir "$base" "$worker" >/dev/null
+  : > "$worker/state/task.meta"
+  out=$(run_hook_cursor_payload "$worker" "$payload"); status=$?
+  expect_code 0 "$status" "Cursor linked worker stop must stay inert"
+  [ -z "$out" ] || fail "Cursor linked worker stop produced output: $out"
+
+  make_secondmate_linked_home_dir "$TMP_ROOT/hook-cursor-sm-base" "$second" >/dev/null
+  : > "$second/state/task.meta"
+  out=$(run_hook_cursor_payload "$second" "$payload"); status=$?
+  expect_code 0 "$status" "Cursor secondmate primary stop must return native follow-up"
+  printf '%s' "$out" | jq -e '.followup_message | contains("bin/fm-watch-arm.sh")' >/dev/null 2>&1 \
+    || fail "Cursor secondmate primary did not stay active: $out"
+  pass "fm-turnend-guard --cursor: linked worker is inert and linked secondmate primary is active"
+}
+
+test_hook_claude_suppresses_native_cursor_stop_duplicate() {
+  local dir payload out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-cursor-duplicate")
+  : > "$dir/state/task.meta"
+  for payload in \
+    '{"hook_event_name":"stop","cursor_version":"2.1.0","status":"completed","loop_count":0}' \
+    '{"cursor_version":"2.1.0","stop_hook_active":false}' \
+    '{"hook_event_name":"damaged","cursor_version":"2.1.0","stop_hook_active":false}'
+  do
+    out=$(printf '%s' "$payload" | FM_HOME="$dir" FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 \
+      bash "$dir/bin/fm-turnend-guard.sh" --claude 2>&1); status=$?
+    expect_code 0 "$status" "Claude compatibility Stop hook must suppress complete or partial Cursor payload"
+    [ -z "$out" ] || fail "Claude compatibility Stop hook duplicated Cursor-versioned feedback: $out"
+    [ ! -e "$dir/state/.turnend-claude-blocks" ] \
+      || fail "Cursor-versioned payload consumed the Claude Stop block budget"
+  done
+
+  out=$(printf '%s' '{"stop_hook_active":false,"session_id":"claude-cursor-env"}' \
+    | CURSOR_AGENT=1 FM_HOME="$dir" FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 \
+      bash "$dir/bin/fm-turnend-guard.sh" --claude 2>&1); status=$?
+  expect_code 2 "$status" "CURSOR_AGENT alone must not suppress an ordinary Claude Stop"
+  assert_contains "$out" "TURN WOULD END BLIND" "ordinary Claude Stop lost its guard feedback"
+  pass "fm-turnend-guard --claude: any Cursor-versioned object is silent without trusting event name or CURSOR_AGENT"
+}
+
 test_grok_adapter_forces_one_resume_when_unhealthy() {
   local dir fakebin log out status
   dir=$(make_primary_dir "$TMP_ROOT/grok-adapter-block")
@@ -1154,6 +1333,13 @@ test_hook_silent_in_crewmate_worktree
 test_hook_silent_without_jq
 test_hook_silent_without_stdin
 test_hook_runs_fast
+test_hook_cursor_native_followup_and_x_mode_need
+test_hook_cursor_status_semantics
+test_hook_cursor_afk_followup_stays_away_specific
+test_hook_cursor_idle_and_healthy_are_silent
+test_hook_cursor_malformed_and_wrong_event_fail_open
+test_hook_cursor_scope_worker_inert_secondmate_active
+test_hook_claude_suppresses_native_cursor_stop_duplicate
 test_grok_adapter_forces_one_resume_when_unhealthy
 test_grok_adapter_loop_guard_skips_resume
 test_grok_adapter_native_false_blocks_without_resume

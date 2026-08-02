@@ -38,10 +38,11 @@ set -u
 CMD=""
 CMD_SET=0
 CLAUDE_MODE=0
+CURSOR_MODE=0
 
 usage() {
   cat <<'EOF'
-Usage: fm-cd-pretool-check.sh [--command <cmd>] [--claude]
+Usage: fm-cd-pretool-check.sh [--command <cmd>] [--claude|--cursor]
 
 With no --command, reads a PreToolUse-style JSON payload on stdin (Grok
 toolInput.command, or Claude/Codex tool_input.command).
@@ -68,7 +69,13 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --claude)
+      [ "$CURSOR_MODE" -eq 0 ] || { echo "error: --claude and --cursor are mutually exclusive" >&2; exit 2; }
       CLAUDE_MODE=1
+      shift
+      ;;
+    --cursor)
+      [ "$CLAUDE_MODE" -eq 0 ] || { echo "error: --claude and --cursor are mutually exclusive" >&2; exit 2; }
+      CURSOR_MODE=1
       shift
       ;;
     -h|--help)
@@ -87,6 +94,21 @@ if [ "$CMD_SET" -eq 0 ]; then
   PAYLOAD=$(cat 2>/dev/null || true)
   [ -n "$PAYLOAD" ] || exit 0
   command -v jq >/dev/null 2>&1 || exit 0
+  if [ "$CLAUDE_MODE" -eq 1 ] && printf '%s' "$PAYLOAD" | jq -e '
+    type == "object"
+    and (.cursor_version | type == "string" and length > 0)
+  ' >/dev/null 2>&1; then
+    exit 0
+  fi
+  if [ "$CURSOR_MODE" -eq 1 ]; then
+    printf '%s' "$PAYLOAD" | jq -e '
+      type == "object"
+      and .hook_event_name == "preToolUse"
+      and (.cursor_version | type == "string" and length > 0)
+      and (.tool_name | type == "string" and length > 0)
+      and (.tool_input | type == "object")
+    ' >/dev/null 2>&1 || exit 0
+  fi
   CMD=$(printf '%s' "$PAYLOAD" | jq -r '(.toolInput.command // .tool_input.command // empty)' 2>/dev/null) || exit 0
 fi
 
@@ -132,12 +154,19 @@ FM_ROOT=${FM_ROOT_OVERRIDE:-$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pw
 # the turn-end guard's separate marker-aware scope. Any failure to confirm the
 # checkout is inert (exit 0), never a block, so a broken environment never
 # denies a shell command.
-[ -f "$FM_ROOT/AGENTS.md" ] || exit 0
-[ -d "$FM_ROOT/bin" ] || exit 0
-command -v git >/dev/null 2>&1 || exit 0
-GIT_DIR=$(git -C "$FM_ROOT" rev-parse --git-dir 2>/dev/null) || exit 0
-GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || exit 0
-[ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || exit 0
+if [ "$CURSOR_MODE" -eq 1 ]; then
+  STATE=${FM_STATE_OVERRIDE:-${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}/state}
+  # shellcheck source=bin/fm-primary-scope-lib.sh
+  . "$SCRIPT_DIR/fm-primary-scope-lib.sh"
+  fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
+else
+  [ -f "$FM_ROOT/AGENTS.md" ] || exit 0
+  [ -d "$FM_ROOT/bin" ] || exit 0
+  command -v git >/dev/null 2>&1 || exit 0
+  GIT_DIR=$(git -C "$FM_ROOT" rev-parse --git-dir 2>/dev/null) || exit 0
+  GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || exit 0
+  [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || exit 0
+fi
 
 POLICY="$FM_ROOT/bin/fm-cd-command-policy.mjs"
 command -v node >/dev/null 2>&1 || exit 0
@@ -161,6 +190,10 @@ json_escape() {
 
 DETAIL="[$CODE] $REASON"
 ESCAPED=$(json_escape "$DETAIL")
+if [ "$CURSOR_MODE" -eq 1 ]; then
+  printf '{"permission":"deny","user_message":"%s","agent_message":"%s"}\n' "$ESCAPED" "$ESCAPED"
+  exit 0
+fi
 printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny"},"systemMessage":"%s"}\n' "$ESCAPED" >&2
 [ "$CLAUDE_MODE" -eq 1 ] || printf '{"decision":"deny","reason":"%s"}\n' "$ESCAPED"
 exit 2

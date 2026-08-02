@@ -691,20 +691,28 @@ fm_pending_reply_send_recovery() {  # <state-dir> <corr_id>
   if [ -n "${FM_PENDING_REPLY_SEND_HOOK:-}" ]; then
     # Hook receives: task_id message
     # shellcheck disable=SC2086
-    if ! eval "$FM_PENDING_REPLY_SEND_HOOK" "$(printf '%q' "$task_id")" "$(printf '%q' "$msg")"; then
-      send_status=1
+    if eval "$FM_PENDING_REPLY_SEND_HOOK" "$(printf '%q' "$task_id")" "$(printf '%q' "$msg")"; then
+      :
+    else
+      send_status=$?
     fi
   else
     if [ -z "$parent_home" ] || [ ! -d "$parent_home" ]; then
       send_status=1
-    elif ! env FM_HOME="$parent_home" FM_PENDING_REPLY_EXISTING_CORR="$corr" \
+    elif env FM_HOME="$parent_home" FM_PENDING_REPLY_EXISTING_CORR="$corr" \
       "$_FM_PENDING_REPLY_LIB_DIR/fm-send.sh" "$task_id" "$msg"; then
-      send_status=1
+      :
+    else
+      send_status=$?
     fi
   fi
   if [ "$send_status" = 0 ]; then
     fm_pending_reply_finish_recovery "$state" "$corr" confirmed
     return $?
+  fi
+  if [ "$send_status" = 3 ]; then
+    fm_pending_reply_finish_recovery "$state" "$corr" unknown || return 1
+    return 1
   fi
   fm_pending_reply_finish_recovery "$state" "$corr" failed || return 1
   return 1
@@ -727,12 +735,13 @@ fm_pending_reply_sender_alive() {  # <record-path>
   [ "$actual" = "$expected" ]
 }
 
-fm_pending_reply_finish_recovery() {  # <state-dir> <corr_id> <confirmed|failed>
+fm_pending_reply_finish_recovery() {  # <state-dir> <corr_id> <confirmed|failed|unknown>
   local state=$1 corr=$2 outcome=$3 rec phase now sent
   rec=$(fm_pending_reply_path "$state" "$corr")
   [ -f "$rec" ] || return 1
   phase=$(fm_pending_reply_get "$rec" phase)
   [ "$phase" = recovery_sending ] || return 1
+  case "$outcome" in confirmed|failed|unknown) ;; *) return 1 ;; esac
   fm_pending_reply_set "$rec" recovery_delivery_outcome "$outcome" || return 1
   if [ "$outcome" = confirmed ]; then
     sent=$(fm_pending_reply_get "$rec" recovery_sent_epoch)
@@ -743,8 +752,9 @@ fm_pending_reply_finish_recovery() {  # <state-dir> <corr_id> <confirmed|failed>
     fm_pending_reply_set "$rec" recovery_turn_seen_busy 0 || return 1
     fm_pending_reply_set "$rec" recovery_turn_completed_epoch "" || return 1
     fm_pending_reply_set "$rec" phase recovery_sent || return 1
+  elif [ "$outcome" = unknown ]; then
+    fm_pending_reply_set "$rec" phase recovery_unknown || return 1
   else
-    [ "$outcome" = failed ] || return 1
     fm_pending_reply_set "$rec" phase recovery_failed || return 1
   fi
 }

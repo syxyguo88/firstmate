@@ -128,6 +128,43 @@ SH
   printf '%s\n' "$case_dir"
 }
 
+install_cursor_tmux_cleanup_mock() {  # <case-dir> <success|fail|unreadable>
+  local case_dir=$1 mode=$2 marker
+  marker="$case_dir/cursor-endpoint-live"
+  : > "$marker"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'marker=%q\n' "$marker"
+    printf 'mode=%q\n' "$mode"
+    cat <<'SH'
+case "${1:-}" in
+  kill-window)
+    if [ "$mode" = success ]; then
+      rm -f "$marker"
+      exit 0
+    fi
+    exit 1
+    ;;
+  list-windows)
+    if [ "$mode" = unreadable ]; then
+      printf '%s\n' 'transient tmux transport failure' >&2
+      exit 1
+    fi
+    [ -f "$marker" ] && printf '%s\n' 'fm-task-x1' 'fm-cursor-child'
+    exit 0
+    ;;
+  display-message)
+    [ "$mode" != unreadable ] || exit 1
+    [ -f "$marker" ]
+    exit
+    ;;
+esac
+exit 0
+SH
+  } > "$case_dir/fakebin/tmux"
+  chmod +x "$case_dir/fakebin/tmux"
+}
+
 add_compatible_tasks_axi() {
   local case_dir=$1
   cat > "$case_dir/fakebin/tasks-axi" <<'SH'
@@ -1264,6 +1301,117 @@ test_teardown_missing_busy_sidecar_completes() {
   pass "teardown completes when an exact busy-state sidecar is already absent"
 }
 
+test_cursor_sidecar_cleanup_preserves_target_cursor_directory() {
+  local case_dir rc
+  case_dir=$(make_case cursor-sidecar-cleanup)
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' 'harness=cursor' >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' '{"version":1,"sessionId":"session-1"}' \
+    > "$case_dir/state/task-x1.cursor-session.json"
+  printf '%s\n' partial > "$case_dir/state/task-x1.cursor-session.json.tmp.1234.deadbeef"
+  mkdir -p "$case_dir/wt/.cursor"
+  printf '%s\n' keep > "$case_dir/wt/.cursor/project-setting"
+  install_cursor_tmux_cleanup_mock "$case_dir" success
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "cursor-sidecar-cleanup: teardown should succeed"
+  assert_absent "$case_dir/state/task-x1.cursor-session.json" \
+    "cursor-sidecar-cleanup: Firstmate's Cursor ACP sidecar survived teardown"
+  assert_absent "$case_dir/state/task-x1.cursor-session.json.tmp.1234.deadbeef" \
+    "cursor-sidecar-cleanup: interrupted atomic Cursor sidecar temp survived teardown"
+  assert_grep 'keep' "$case_dir/wt/.cursor/project-setting" \
+    "cursor-sidecar-cleanup: teardown changed the target worktree's .cursor content"
+  pass "ordinary teardown removes only the Cursor ACP state sidecar and preserves target .cursor content"
+}
+
+test_cursor_teardown_retains_identity_when_endpoint_close_is_unconfirmed() {
+  local case_dir rc
+  case_dir=$(make_case cursor-close-unconfirmed)
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' 'harness=cursor' >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' '{"version":1,"sessionId":"session-live"}' \
+    > "$case_dir/state/task-x1.cursor-session.json"
+  install_cursor_tmux_cleanup_mock "$case_dir" fail
+
+  set +e
+  FM_CURSOR_TEARDOWN_CONFIRM_ATTEMPTS=1 \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "cursor-close-unconfirmed: teardown erased a live Cursor endpoint"
+  assert_grep 'not confirmed gone; retaining every durable task record' "$case_dir/stderr" \
+    "cursor-close-unconfirmed: refusal did not explain endpoint uncertainty"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "cursor-close-unconfirmed: teardown erased endpoint metadata"
+  assert_present "$case_dir/state/task-x1.cursor-session.json" \
+    "cursor-close-unconfirmed: teardown erased resumable Cursor session identity"
+  pass "Cursor teardown retains durable identity when endpoint closure is not confirmed"
+}
+
+test_cursor_teardown_retains_identity_when_presence_is_unreadable() {
+  local case_dir rc
+  case_dir=$(make_case cursor-presence-unreadable)
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' 'harness=cursor' >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' '{"version":1,"sessionId":"session-unreadable"}' \
+    > "$case_dir/state/task-x1.cursor-session.json"
+  install_cursor_tmux_cleanup_mock "$case_dir" unreadable
+
+  set +e
+  FM_CURSOR_TEARDOWN_CONFIRM_ATTEMPTS=1 \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "cursor-presence-unreadable: transient probe failure authorized cleanup"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "cursor-presence-unreadable: teardown erased endpoint metadata"
+  assert_present "$case_dir/state/task-x1.cursor-session.json" \
+    "cursor-presence-unreadable: teardown erased resumable session identity"
+  pass "Cursor teardown treats unreadable endpoint presence as refusal, never absence"
+}
+
+test_forced_secondmate_cleanup_removes_nested_cursor_sidecar() {
+  local case_dir home rc
+  case_dir=$(make_case nested-cursor-sidecar-cleanup)
+  write_meta "$case_dir" local-only secondmate
+  home="$case_dir/secondmate-home"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  fm_write_meta "$home/state/cursor-child.meta" \
+    "window=firstmate:fm-cursor-child" \
+    "endpoint_task_id=cursor-child" \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    "harness=cursor" \
+    "kind=ship" \
+    "mode=local-only"
+  printf '%s\n' '{"version":1,"sessionId":"nested-session"}' \
+    > "$home/state/cursor-child.cursor-session.json"
+  printf '%s\n' partial > "$home/state/cursor-child.cursor-session.json.tmp.5678.deadbeef"
+  mkdir -p "$case_dir/wt/.cursor"
+  printf '%s\n' nested-keep > "$case_dir/wt/.cursor/project-setting"
+  install_cursor_tmux_cleanup_mock "$case_dir" success
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "nested-cursor-sidecar-cleanup: forced secondmate teardown should succeed"
+  assert_absent "$home" \
+    "nested-cursor-sidecar-cleanup: retired secondmate home (and nested Cursor sidecar) survived"
+  assert_grep 'nested-keep' "$case_dir/wt/.cursor/project-setting" \
+    "nested-cursor-sidecar-cleanup: forced child cleanup changed target .cursor content"
+  pass "forced secondmate child cleanup removes nested Cursor state without touching target .cursor content"
+}
+
 test_herdr_teardown_clears_escalation_marker() {
   local case_dir marker
   case_dir=$(make_case herdr-marker-cleanup)
@@ -1833,6 +1981,10 @@ test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_teardown_missing_busy_sidecar_completes
+test_cursor_sidecar_cleanup_preserves_target_cursor_directory
+test_cursor_teardown_retains_identity_when_endpoint_close_is_unconfirmed
+test_cursor_teardown_retains_identity_when_presence_is_unreadable
+test_forced_secondmate_cleanup_removes_nested_cursor_sidecar
 test_herdr_teardown_clears_escalation_marker
 test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes
 test_herdr_flat_teardown_refuses_records_on_unparseable_presence

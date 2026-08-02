@@ -145,6 +145,27 @@ test_guard_never_classifies_mcp_tools() {
   pass "MCP tool names are never classified as harness delegation"
 }
 
+test_cursor_native_mcp_namespace_is_exempt_only_with_prefix() {
+  local payload out rc
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"MCP:tracker_create_task","tool_input":{"title":"ship"}}'
+  rc=0
+  out=$(printf '%s' "$payload" \
+    | FM_ROOT_OVERRIDE="$PRIMARY" FM_HOME="$PRIMARY" FM_STATE_OVERRIDE="$STATE" \
+      "$CHECK" --cursor 2>&1) || rc=$?
+  [ "$rc" -eq 0 ] || fail "Cursor native MCP tool must allow with exit 0, got $rc"
+  [ -z "$out" ] || fail "Cursor native MCP tool allow must be silent: $out"
+
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"tracker_create_task","tool_input":{"title":"ship"}}'
+  rc=0
+  out=$(printf '%s' "$payload" \
+    | FM_ROOT_OVERRIDE="$PRIMARY" FM_HOME="$PRIMARY" FM_STATE_OVERRIDE="$STATE" \
+      "$CHECK" --cursor 2>&1) || rc=$?
+  [ "$rc" -eq 0 ] || fail "ordinary delegation-shaped Cursor tool deny must use native exit 0, got $rc"
+  printf '%s' "$out" | jq -e '.permission == "deny" and (.agent_message | contains("blocked tool: tracker_create_task"))' >/dev/null 2>&1 \
+    || fail "ordinary tracker_create_task must not inherit the MCP namespace exemption: $out"
+  pass "Cursor native MCP: namespace is exempt without releasing ordinary delegation-shaped names"
+}
+
 test_deny_message_defers_to_intake_classification() {
   local actual
   printf '#!/usr/bin/env bash\n' > "$PRIMARY/bin/fm-scout.sh"
@@ -195,6 +216,13 @@ test_task_worktree_and_non_firstmate_repo_are_inert() {
   [ "$rc" -eq 0 ] || fail "a crewmate task worktree must be out of scope, got exit $rc: $(cat "$ERR")"
   [ ! -s "$OUT" ] || fail "task-worktree no-op wrote stdout: $(cat "$OUT")"
   [ ! -s "$ERR" ] || fail "task-worktree no-op wrote stderr: $(cat "$ERR")"
+  rc=0
+  printf '%s' '{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Agent","tool_input":{}}' \
+    | FM_ROOT_OVERRIDE="$child" FM_HOME="$child" FM_STATE_OVERRIDE="$child/state" \
+      "$CHECK" --cursor > "$OUT" 2> "$ERR" || rc=$?
+  [ "$rc" -eq 0 ] || fail "Cursor guard must be inert in a crewmate task worktree"
+  [ ! -s "$OUT" ] && [ ! -s "$ERR" ] \
+    || fail "Cursor guard produced output in a crewmate task worktree"
 
   mkdir -p "$plain/bin"
   git -C "$plain" init -q
@@ -214,7 +242,14 @@ test_secondmate_home_is_in_scope() {
   FM_ROOT_OVERRIDE="$second" FM_HOME="$second" FM_STATE_OVERRIDE="$second/state" \
     "$CHECK" --claude --tool Agent > "$OUT" 2> "$ERR" || rc=$?
   [ "$rc" -eq 2 ] || fail "a marked secondmate home operates a fleet and must be guarded, got exit $rc"
-  pass "a marked secondmate home is guarded even though it is a linked worktree"
+  rc=0
+  printf '%s' '{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Agent","tool_input":{}}' \
+    | FM_ROOT_OVERRIDE="$second" FM_HOME="$second" FM_STATE_OVERRIDE="$second/state" \
+      "$CHECK" --cursor > "$OUT" 2> "$ERR" || rc=$?
+  [ "$rc" -eq 0 ] || fail "Cursor secondmate deny must use native exit 0"
+  jq -e '.permission == "deny"' "$OUT" >/dev/null 2>&1 \
+    || fail "Cursor guard did not activate in a marked linked secondmate home: $(cat "$OUT")"
+  pass "a marked secondmate home is guarded for Claude and Cursor even though it is a linked worktree"
 }
 
 test_stdin_transports_and_output_shapes() {
@@ -243,6 +278,76 @@ test_stdin_transports_and_output_shapes() {
   [ "$rc" -eq 0 ] || fail "Bash through stdin must allow, got exit $rc"
   [ ! -s "$OUT" ] && [ ! -s "$ERR" ] || fail "stdin allow wrote output"
   pass "both stdin transports classify correctly and Claude's deny keeps stdout empty"
+}
+
+test_cursor_native_deny_allow_and_duplicate_suppression() {
+  local payload out rc=0
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Agent","tool_input":{"prompt":"go"}}'
+  out=$(printf '%s' "$payload" \
+    | FM_ROOT_OVERRIDE="$PRIMARY" FM_HOME="$PRIMARY" FM_STATE_OVERRIDE="$STATE" \
+      "$CHECK" --cursor 2>&1) || rc=$?
+  [ "$rc" -eq 0 ] || fail "Cursor delegation deny must return native JSON with exit 0, got $rc"
+  printf '%s' "$out" | jq -e '
+    (keys | sort) == ["agent_message", "permission", "user_message"]
+    and .permission == "deny"
+    and (.user_message | startswith("[subagent-dispatch]"))
+    and (.agent_message | startswith("[subagent-dispatch]"))
+    and (.agent_message | contains("blocked tool: Agent"))
+  ' >/dev/null 2>&1 || fail "Cursor delegation deny must be flat native JSON with the existing reason: $out"
+
+  rc=0
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Read","tool_input":{"path":"README.md"}}'
+  out=$(printf '%s' "$payload" \
+    | FM_ROOT_OVERRIDE="$PRIMARY" FM_HOME="$PRIMARY" FM_STATE_OVERRIDE="$STATE" \
+      "$CHECK" --cursor 2>&1) || rc=$?
+  [ "$rc" -eq 0 ] || fail "Cursor ordinary tool must allow with exit 0, got $rc"
+  [ -z "$out" ] || fail "Cursor ordinary tool allow must be silent: $out"
+
+  rc=0
+  payload='{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Agent","tool_input":{"prompt":"go"}}'
+  out=$(printf '%s' "$payload" \
+    | FM_ROOT_OVERRIDE="$PRIMARY" FM_HOME="$PRIMARY" FM_STATE_OVERRIDE="$STATE" \
+      "$CHECK" --claude 2>&1) || rc=$?
+  [ "$rc" -eq 0 ] || fail "--claude must suppress native Cursor delegation duplicate, got $rc"
+  [ -z "$out" ] || fail "--claude native Cursor delegation duplicate must be silent: $out"
+
+  for payload in \
+    '{"cursor_version":"2.1.0","tool_name":"Agent","tool_input":{"prompt":"go"}}' \
+    '{"hook_event_name":"damaged","cursor_version":"2.1.0","tool_name":"Agent","tool_input":{"prompt":"go"}}'
+  do
+    rc=0
+    out=$(printf '%s' "$payload" \
+      | FM_ROOT_OVERRIDE="$PRIMARY" FM_HOME="$PRIMARY" FM_STATE_OVERRIDE="$STATE" \
+        "$CHECK" --claude 2>&1) || rc=$?
+    [ "$rc" -eq 0 ] || fail "--claude must suppress partial Cursor delegation payload, got $rc"
+    [ -z "$out" ] || fail "--claude partial Cursor delegation payload must be silent: $out"
+  done
+
+  rc=0
+  out=$(printf '%s' '{"tool_name":"Agent","tool_input":{"prompt":"go"}}' \
+    | CURSOR_AGENT=1 FM_ROOT_OVERRIDE="$PRIMARY" FM_HOME="$PRIMARY" FM_STATE_OVERRIDE="$STATE" \
+      "$CHECK" --claude 2>&1) || rc=$?
+  [ "$rc" -eq 2 ] || fail "CURSOR_AGENT alone must not suppress ordinary Claude delegation deny, got $rc"
+  assert_contains "$out" '[subagent-dispatch]' "ordinary Claude delegation deny lost its reason"
+  pass "subagent guard --cursor: native behavior stays strict while Claude suppresses partial Cursor-versioned objects"
+}
+
+test_cursor_malformed_transport_fails_open() {
+  local payload out rc
+  for payload in \
+    '{not-json' \
+    '{}' \
+    '{"hook_event_name":"preToolUse","cursor_version":"2.1.0","tool_name":"Agent","tool_input":[]}' \
+    '{"hook_event_name":"stop","cursor_version":"2.1.0","tool_name":"Agent","tool_input":{}}'
+  do
+    rc=0
+    out=$(printf '%s' "$payload" \
+      | FM_ROOT_OVERRIDE="$PRIMARY" FM_HOME="$PRIMARY" FM_STATE_OVERRIDE="$STATE" \
+        "$CHECK" --cursor 2>&1) || rc=$?
+    [ "$rc" -eq 0 ] || fail "invalid Cursor delegation payload must fail open, got $rc"
+    [ -z "$out" ] || fail "invalid Cursor delegation payload must be silent: $out"
+  done
+  pass "subagent guard --cursor: malformed and wrong-event payloads fail open silently"
 }
 
 test_malformed_transport_fails_open() {
@@ -282,10 +387,13 @@ test_guard_allows_ordinary_and_observe_only_tools
 test_guard_allows_session_local_todo_tools
 test_plan_only_exclusion_is_exact_name
 test_guard_never_classifies_mcp_tools
+test_cursor_native_mcp_namespace_is_exempt_only_with_prefix
 test_deny_message_defers_to_intake_classification
 test_escape_hatch_allows_deliberate_use
 test_task_worktree_and_non_firstmate_repo_are_inert
 test_secondmate_home_is_in_scope
 test_stdin_transports_and_output_shapes
+test_cursor_native_deny_allow_and_duplicate_suppression
+test_cursor_malformed_transport_fails_open
 test_malformed_transport_fails_open
 test_missing_jq_stdin_transport_fails_open

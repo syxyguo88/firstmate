@@ -49,7 +49,7 @@ delegate  spawn  dispatch  handoff  remote  sendmessage  monitor
 
 Three exclusions keep the shape test from producing false positives.
 
-- A name beginning `mcp__` is never classified.
+- A name beginning `mcp__` or Cursor's native `MCP:` prefix is never classified.
   An MCP server chooses its own tool names, a task or agent noun there is common, and it has no bearing on fleet dispatch.
 - `OBSERVE_ONLY_TOOLS`: the exact names `taskoutput`, `taskstop`, `taskget`, `tasklist`, `cronlist`, `bashoutput`, and `killshell` are allowed.
   These observe or stop work that already exists rather than creating it, and denying them at this layer could strand already-running work with no way to inspect or end it.
@@ -167,6 +167,7 @@ A tool removed from the schema stays removed, so a genuinely intended use of a l
 - Default deny mode also writes `{"decision":"deny","reason":"[subagent-dispatch] ..."}` to stdout for Grok.
 - `--claude` suppresses stdout completely, because Claude Code ignores a PreToolUse deny when stdout is nonempty.
   This is the same verified quirk recorded in [`arm-pretool-check.md`](arm-pretool-check.md), and the tracked Claude hook therefore passes `--claude`.
+- `--cursor` validates Cursor's native payload and returns exit 0 with `{"permission":"deny","user_message":"...","agent_message":"..."}`.
 - Malformed or empty stdin, invalid JSON, a payload with no tool name, and missing `jq` for stdin transport all fail open with exit 0 and no output.
 
 The deny message names the real dispatch path.
@@ -182,6 +183,7 @@ Applicability turns on one question: does the harness expose built-in delegation
 | --- | --- | --- |
 | Claude | 16 known tools, listed above | Scoped guard wired and live-verified; untracked local deny list verified and recommended. |
 | Codex | none | Not applicable, verified empirically below. Codex 0.144.1 exposes no subagent, sub-task, or delegated-agent tool, so there is nothing to remove or intercept. `.codex/hooks.json` is unchanged. |
+| Cursor | Native delegation-shaped tools plus `MCP:` server tools | Scoped native `preToolUse` guard wired with matcher `.*`; delegation-shaped names deny, while every `MCP:` name is exempt. |
 | Grok | present, exact tokens unconfirmed | Not wired pending live verification. See below. |
 | OpenCode | present, exact tokens unconfirmed | Not wired pending live verification. See below. |
 | Pi | none reported | Not wired pending live verification. See below. |
@@ -220,6 +222,15 @@ SUBAGENT_TOOL=no
 
 `multi_tool_use.parallel` batches calls to the tools above; it does not spawn an agent.
 Codex is therefore not applicable today, and this table row is the tripwire: if a future Codex release adds a delegated-agent tool, wire `.codex/hooks.json` the same way its `Bash` PreToolUse entries already forward stdin to a checker.
+
+### Cursor native guard
+
+`.cursor/hooks.json` matches every native `preToolUse` event and invokes the
+shared checker with `--cursor`. The checker first validates
+`hook_event_name=preToolUse`, `cursor_version`, `tool_name`, and `tool_input`,
+then applies the same primary-home scope and delegation-shape policy as Claude.
+Cursor's MCP namespace is `MCP:<server_tool>` rather than Claude's `mcp__`
+prefix, so both forms are explicitly exempt before stem matching.
 
 ### Grok, OpenCode, and Pi, inspected but not wired
 
@@ -353,7 +364,7 @@ The live consequence is confirmed by the shipped-guard result above: Claude hono
 ## Automated validation
 
 `tests/fm-subagent-pretool-check.test.sh` owns the acceptance matrix and is registered in the `pure-contract-unit` family in `bin/fm-test-run.sh`.
-It covers the tracked Claude settings boundary that forbids a `permissions` key; the match-all Claude hook registration; denial of every work-creating delegation tool by shape; denial of twelve hypothetical future tool names that appear on no list; the observe-or-stop, plan-only, and MCP exclusions; the exactness of the plan-only exclusion against six near-miss names a substring or shorter-stem widening would release; the scout-present and scout-absent message variants; the escape hatch including its fail-closed values; inertness in a linked task worktree and in a non-firstmate repo; in-scope enforcement for a marked secondmate home; both stdin transports; the empty-stdout requirement; fail-open transport behavior; and the preserved `Bash` seatbelts and `Stop` guard.
+It covers the tracked Claude settings boundary that forbids a `permissions` key; the match-all Claude and Cursor hook registrations; denial of every work-creating delegation tool by shape; denial of twelve hypothetical future tool names that appear on no list; the observe-or-stop, plan-only, and both MCP-prefix exclusions; the exactness of the plan-only exclusion against six near-miss names a substring or shorter-stem widening would release; the scout-present and scout-absent message variants; the escape hatch including its fail-closed values; inertness in a linked task worktree and in a non-firstmate repo; in-scope enforcement for a marked secondmate home; the stdin transports; Cursor's native deny shape; the Claude empty-stdout requirement; fail-open transport behavior; and the preserved Shell/Bash seatbelts and Stop guard.
 
 Run:
 
@@ -372,5 +383,7 @@ Without an independent X-mode need, unaccounted primary work therefore reads as 
 
 The durable fix for that class is to make the guards treat "the primary is doing project-shaped work with zero `state/*.meta` files" as a suspicious state rather than an idle one.
 That would catch this class on any harness, including work created through `Bash`.
-This change fences only the Claude tool surface.
+The shipped hook fences the verified Claude and Cursor tool surfaces, but it
+still cannot detect project-shaped work hidden behind an allowed generic shell
+call or an unwired harness surface.
 That is a separate change to `bin/fm-supervision-lib.sh` and `bin/fm-turnend-guard.sh` and is out of scope here.

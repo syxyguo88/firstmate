@@ -81,10 +81,11 @@ PLAN_ONLY_TOOLS='taskcreate taskupdate'
 TOOL=""
 TOOL_SET=0
 CLAUDE_MODE=0
+CURSOR_MODE=0
 
 usage() {
   cat <<'EOF'
-Usage: fm-subagent-pretool-check.sh [--tool <tool-name>] [--claude]
+Usage: fm-subagent-pretool-check.sh [--tool <tool-name>] [--claude|--cursor]
 
 With no --tool, reads a PreToolUse-style JSON payload on stdin (Claude/Codex
 tool_name, or Grok toolName).
@@ -118,7 +119,13 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --claude)
+      [ "$CURSOR_MODE" -eq 0 ] || { echo "error: --claude and --cursor are mutually exclusive" >&2; exit 2; }
       CLAUDE_MODE=1
+      shift
+      ;;
+    --cursor)
+      [ "$CLAUDE_MODE" -eq 0 ] || { echo "error: --claude and --cursor are mutually exclusive" >&2; exit 2; }
+      CURSOR_MODE=1
       shift
       ;;
     -h|--help)
@@ -137,6 +144,21 @@ if [ "$TOOL_SET" -eq 0 ]; then
   PAYLOAD=$(cat 2>/dev/null || true)
   [ -n "$PAYLOAD" ] || exit 0
   command -v jq >/dev/null 2>&1 || exit 0
+  if [ "$CLAUDE_MODE" -eq 1 ] && printf '%s' "$PAYLOAD" | jq -e '
+    type == "object"
+    and (.cursor_version | type == "string" and length > 0)
+  ' >/dev/null 2>&1; then
+    exit 0
+  fi
+  if [ "$CURSOR_MODE" -eq 1 ]; then
+    printf '%s' "$PAYLOAD" | jq -e '
+      type == "object"
+      and .hook_event_name == "preToolUse"
+      and (.cursor_version | type == "string" and length > 0)
+      and (.tool_name | type == "string" and length > 0)
+      and (.tool_input | type == "object")
+    ' >/dev/null 2>&1 || exit 0
+  fi
   TOOL=$(printf '%s' "$PAYLOAD" | jq -r '(.tool_name // .toolName // empty)' 2>/dev/null) || exit 0
 fi
 
@@ -149,7 +171,7 @@ LC_ALL=C NORMALIZED=$(printf '%s' "$TOOL" | tr '[:upper:]' '[:lower:]' | tr -cd 
 # here: an MCP server with a task or agent noun in a tool name is common and
 # blocking it would be a false positive with no bearing on fleet dispatch.
 case "$TOOL" in
-  mcp__*) exit 0 ;;
+  mcp__*|MCP:*) exit 0 ;;
 esac
 
 for allowed in $OBSERVE_ONLY_TOOLS $PLAN_ONLY_TOOLS; do
@@ -202,6 +224,10 @@ json_escape() {
 }
 
 ESCAPED=$(json_escape "$REASON")
+if [ "$CURSOR_MODE" -eq 1 ]; then
+  printf '{"permission":"deny","user_message":"%s","agent_message":"%s"}\n' "$ESCAPED" "$ESCAPED"
+  exit 0
+fi
 printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny"},"systemMessage":"%s"}\n' "$ESCAPED" >&2
 [ "$CLAUDE_MODE" -eq 1 ] || printf '{"decision":"deny","reason":"%s"}\n' "$ESCAPED"
 exit 2

@@ -29,6 +29,12 @@ run_nudge() {
   FM_GATE_REFUSE_BYPASS=0 FM_ROOT_OVERRIDE="$root" FM_HOME="$root" "$NUDGE"
 }
 
+run_cursor_nudge() {
+  local root=$1 payload=$2
+  printf '%s' "$payload" | FM_GATE_REFUSE_BYPASS=0 FM_ROOT_OVERRIDE="$root" \
+    FM_HOME="$root" "$NUDGE" --cursor
+}
+
 expect_silent_zero() {
   local label=$1
   shift
@@ -47,6 +53,91 @@ test_genuine_primary_nudges() {
   prefix_hex=$(printf '%s' "$out" | head -c 3 | od -An -tx1 | tr -d ' \n')
   [ "$prefix_hex" = e281a3 ] || fail "genuine primary nudge lost its U+2063 operational marker: $prefix_hex"
   pass "fm-sessionstart-nudge: a genuine primary gets one explicitly marked instruction line"
+}
+
+test_cursor_primary_returns_native_context_json() {
+  local root="$TMP_ROOT/cursor-primary" out payload status=0
+  make_primary "$root"
+  payload='{"hook_event_name":"sessionStart","cursor_version":"2.1.0","session_id":"cursor-session","is_background_agent":false,"composer_mode":"agent"}'
+  out=$(run_cursor_nudge "$root" "$payload") || status=$?
+  expect_code 0 "$status" "Cursor primary sessionStart nudge"
+  printf '%s' "$out" | jq -e --arg expected "$NUDGE_LINE" '
+    (keys == ["additional_context"]) and .additional_context == $expected
+  ' >/dev/null || fail "Cursor sessionStart output must decode exactly to the operational nudge: $out"
+  pass "fm-sessionstart-nudge --cursor: native JSON carries the exact operational nudge"
+}
+
+test_cursor_malformed_and_wrong_event_fail_open() {
+  local root="$TMP_ROOT/cursor-invalid" payload
+  make_primary "$root"
+  for payload in \
+    '{not-json' \
+    '{}' \
+    '{"hook_event_name":"SessionStart","cursor_version":"2.1.0","session_id":"s","is_background_agent":false}' \
+    '{"hook_event_name":"sessionStart","session_id":"s","is_background_agent":false}' \
+    '{"hook_event_name":"sessionStart","cursor_version":"2.1.0","session_id":7,"is_background_agent":false}' \
+    '{"hook_event_name":"sessionStart","cursor_version":"2.1.0","session_id":"s","is_background_agent":"false"}'
+  do
+    expect_silent_zero "invalid Cursor sessionStart payload" \
+      run_cursor_nudge "$root" "$payload"
+  done
+  pass "fm-sessionstart-nudge --cursor: malformed and non-sessionStart payloads fail open silently"
+}
+
+test_cursor_scope_keeps_worker_inert_and_secondmate_active() {
+  local base="$TMP_ROOT/cursor-scope-base" worker="$TMP_ROOT/cursor-worker"
+  local second="$TMP_ROOT/cursor-secondmate" payload out status=0
+  fm_git_worktree "$base" "$worker" fm/cursor-sessionstart-worker
+  mkdir -p "$worker/bin" "$worker/state"
+  : > "$worker/AGENTS.md"
+  payload='{"hook_event_name":"sessionStart","cursor_version":"2.1.0","session_id":"scope","is_background_agent":false}'
+  expect_silent_zero "Cursor linked worker nudge" run_cursor_nudge "$worker" "$payload"
+
+  git -C "$base" worktree add --quiet -b fm/cursor-sessionstart-secondmate "$second"
+  mkdir -p "$second/bin" "$second/state"
+  : > "$second/AGENTS.md"
+  printf 'cursor-sm\n' > "$second/.fm-secondmate-home"
+  out=$(run_cursor_nudge "$second" "$payload") || status=$?
+  expect_code 0 "$status" "Cursor secondmate sessionStart nudge"
+  printf '%s' "$out" | jq -e --arg expected "$NUDGE_LINE" \
+    '.additional_context == $expected' >/dev/null \
+    || fail "Cursor secondmate primary did not receive native context JSON: $out"
+  pass "fm-sessionstart-nudge --cursor: linked worker is inert and marked secondmate primary is active"
+}
+
+test_claude_mode_suppresses_only_native_cursor_fingerprint() {
+  local root="$TMP_ROOT/claude-duplicate" payload out status
+  make_primary "$root"
+  for payload in \
+    '{"hook_event_name":"sessionStart","cursor_version":"2.1.0"}' \
+    '{"cursor_version":"2.1.0"}' \
+    '{"hook_event_name":"damaged","cursor_version":"2.1.0"}'
+  do
+    status=0
+    out=$(printf '%s' "$payload" \
+      | FM_GATE_REFUSE_BYPASS=0 FM_ROOT_OVERRIDE="$root" FM_HOME="$root" \
+        "$NUDGE" --claude 2>&1) || status=$?
+    expect_code 0 "$status" "Claude compatibility hook on Cursor-versioned payload"
+    [ -z "$out" ] || fail "--claude must suppress complete or partial Cursor payloads: $out"
+  done
+
+  status=0
+  out=$(printf '%s' '{"hook_event_name":"SessionStart","source":"startup"}' \
+    | CURSOR_AGENT=1 FM_GATE_REFUSE_BYPASS=0 FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$root" "$NUDGE" --claude 2>&1) || status=$?
+  expect_code 0 "$status" "ordinary Claude sessionStart payload"
+  [ "$out" = "$NUDGE_LINE" ] \
+    || fail "--claude must preserve raw output when CURSOR_AGENT alone is set: $out"
+  pass "fm-sessionstart-nudge --claude: any Cursor-versioned object is silent without trusting event name or CURSOR_AGENT"
+}
+
+test_claude_registration_selects_claude_mode() {
+  local command
+  command=$(jq -r '.hooks.SessionStart[0].hooks[0].command // empty' \
+    "$ROOT/.claude/settings.json")
+  assert_contains "$command" 'fm-sessionstart-nudge.sh --claude' \
+    "Claude SessionStart registration must select the raw Claude adapter mode"
+  pass ".claude settings: SessionStart explicitly selects --claude"
 }
 
 test_gate_env_is_silent() {
@@ -149,6 +240,11 @@ EOF
 }
 
 test_genuine_primary_nudges
+test_cursor_primary_returns_native_context_json
+test_cursor_malformed_and_wrong_event_fail_open
+test_cursor_scope_keeps_worker_inert_and_secondmate_active
+test_claude_mode_suppresses_only_native_cursor_fingerprint
+test_claude_registration_selects_claude_mode
 test_gate_env_is_silent
 test_gate_common_dir_is_silent
 test_unmarked_linked_worktree_is_silent

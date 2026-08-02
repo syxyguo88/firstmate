@@ -1003,6 +1003,60 @@ test_secondmate_spawn_refuses_cmux_backend() {
   pass "fm-spawn.sh: refuses backend=cmux for --secondmate spawns (mirrors Orca's refusal; no secondmate launch design exists yet)"
 }
 
+test_endpoint_confirmed_gone_requires_valid_workspace_inventory() {
+  local dir fb status
+
+  dir="$TMP_ROOT/endpoint-gone"; mkdir -p "$dir/responses"
+  cmux_workspace_list_response "$dir" 1
+  fb=$(make_cmux_fakebin "$dir")
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_endpoint_confirmed_gone ws-1:sf-1' "$ROOT" \
+    || fail "valid workspace inventory without the exact workspace must confirm gone"
+
+  dir="$TMP_ROOT/endpoint-present"; mkdir -p "$dir/responses"
+  cmux_workspace_list_response "$dir" 1 ws-1 task
+  cmux_panes_response "$dir" 2 sf-1
+  fb=$(make_cmux_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_endpoint_confirmed_gone ws-1:sf-1' "$ROOT"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "inventory containing the exact surface confirmed it gone"
+
+  dir="$TMP_ROOT/endpoint-unreadable"; mkdir -p "$dir/responses"
+  printf '%s\n' 1 > "$dir/responses/1.exit"
+  fb=$(make_cmux_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_endpoint_confirmed_gone ws-1:sf-1' "$ROOT"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "unreadable workspace inventory confirmed the endpoint gone"
+
+  dir="$TMP_ROOT/endpoint-malformed-workspace"; mkdir -p "$dir/responses"
+  printf '%s\n' '{"workspaces":[{}]}' > "$dir/responses/1.out"
+  fb=$(make_cmux_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_endpoint_confirmed_gone ws-1:sf-1' "$ROOT"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "malformed workspace entries confirmed the endpoint gone"
+
+  dir="$TMP_ROOT/endpoint-malformed-pane"; mkdir -p "$dir/responses"
+  cmux_workspace_list_response "$dir" 1 ws-1 task
+  printf '%s\n' '{"panes":[{}]}' > "$dir/responses/2.out"
+  fb=$(make_cmux_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_endpoint_confirmed_gone ws-1:sf-1' "$ROOT"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "malformed pane entries confirmed the endpoint gone"
+  pass "cmux endpoint disappearance requires valid inventories that omit the exact target"
+}
+
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-backend.sh"
 
@@ -1061,3 +1115,4 @@ test_kill_is_best_effort_when_close_workspace_fails
 test_kill_recovers_stale_target_by_label
 test_list_live_filters_by_title_prefix
 test_secondmate_spawn_refuses_cmux_backend
+test_endpoint_confirmed_gone_requires_valid_workspace_inventory

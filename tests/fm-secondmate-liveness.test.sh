@@ -109,9 +109,13 @@ test_tmux_agent_state_classifies() {
     [ "$out" = dead ] || fail "a bare $shell foreground process should classify as dead, got '$out'"
   done
 
+  for lookalike in node agent cursor-agent Cursor fm-cursor-acp-helper; do
+    fb=$(make_probe_tmux "$TMP_ROOT/tmux-lookalike-$lookalike" "$lookalike")
+    out=$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_agent_state tmux sess:win' "$ROOT")
+    [ "$out" = ambiguous ] \
+      || fail "Cursor lookalike '$lookalike' should classify as ambiguous, got '$out'"
+  done
   fb=$(make_probe_tmux "$TMP_ROOT/tmux-node" node)
-  out=$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_agent_state tmux sess:win' "$ROOT")
-  [ "$out" = ambiguous ] || fail "an existing node process should classify as ambiguous, got '$out'"
   [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_agent_alive tmux sess:win' "$ROOT")" = unknown ] \
     || fail "the compatibility view must keep an existing node process unknown"
 
@@ -134,6 +138,141 @@ test_tmux_agent_state_classifies() {
   done
 
   pass "fm_backend_tmux_agent_state: separates live, dead, missing, ambiguous, and unreadable"
+}
+
+make_cursor_child_probe() {  # <dir> <foreground-command> <shape>
+  local dir=$1 foreground=$2 shape=$3 fakebin
+  fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/tmux" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in
+  list-windows) printf '%s\n' win ;;
+  display-message)
+    case "\$*" in
+      *pane_current_command*) printf '%s\n' '$foreground' ;;
+      *pane_pid*) printf '%s\n' 400 ;;
+    esac
+    ;;
+esac
+exit 0
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' '400 1 zsh zsh'
+SH
+  case "$shape" in
+    direct)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 agent agent --trust --force acp'
+SH
+      ;;
+    direct-model)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 agent /tmp/fake/agent --trust --force --model cursor model beta acp'
+SH
+      ;;
+    official-node)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 node agent /opt/cursor-agent/versions/2026.08.0/index.js --trust --force acp'
+SH
+      ;;
+    official-node-model)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 node /usr/local/bin/agent /opt/cursor-agent/versions/2026.08.0/index.js --trust --force --model cursor model beta acp'
+SH
+      ;;
+    official-node-ca)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 node agent --use-system-ca /opt/cursor-agent/versions/2026.08.0/index.js --trust --force --model cursor model beta acp'
+SH
+      ;;
+    option-shaped-model)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 agent agent --trust --force --model --debug cursor model beta acp'
+SH
+      ;;
+    official-wrong-path)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 node agent --use-system-ca /opt/cursor-helper/versions/2026.08.0/index.js --trust --force acp'
+SH
+      ;;
+    official-wrong-leading-option)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 node agent --unsafe-ca /opt/cursor-agent/versions/2026.08.0/index.js --trust --force acp'
+SH
+      ;;
+    official-extra-tail)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 node agent /opt/cursor-agent/versions/2026.08.0/index.js --trust --force --debug acp'
+SH
+      ;;
+    no-child)
+      printf '%s\n' "printf '%s\\n' '410 400 fm-cursor-acp fm-cursor-acp'" >>"$fakebin/ps"
+      ;;
+    bad-args)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 agent agent --trust --force chat'
+SH
+      ;;
+    generic-node)
+      cat >>"$fakebin/ps" <<'SH'
+printf '%s\n' '410 400 fm-cursor-acp fm-cursor-acp'
+printf '%s\n' '411 410 node node /tmp/index.js --trust --force acp'
+SH
+      ;;
+    unowned)
+      printf '%s\n' "printf '%s\\n' '411 400 agent agent --trust --force acp'" >>"$fakebin/ps"
+      ;;
+  esac
+  chmod +x "$fakebin/tmux" "$fakebin/ps"
+  printf '%s\n' "$fakebin"
+}
+
+test_tmux_agent_state_verifies_cursor_acp_child_ancestry() {
+  local fb out spec foreground shape
+  for spec in \
+    "bridge-direct:fm-cursor-acp:direct" \
+    "agent-direct-spaced-model:agent:direct-model" \
+    "node-official:node:official-node" \
+    "bridge-official-spaced-model:fm-cursor-acp:official-node-model" \
+    "node-official-system-ca-spaced-model:node:official-node-ca"
+  do
+    IFS=: read -r label foreground shape <<<"$spec"
+    fb=$(make_cursor_child_probe "$TMP_ROOT/tmux-$label" "$foreground" "$shape")
+    out=$(PATH="$fb:$BASE_PATH" bash -c \
+      '. "$0/bin/fm-backend.sh"; fm_backend_agent_state tmux sess:win' "$ROOT")
+    [ "$out" = alive ] \
+      || fail "verified Cursor ACP shape $label should classify alive, got '$out'"
+  done
+
+  for spec in \
+    "bridge-without-child:fm-cursor-acp:no-child" \
+    "wrong-agent-args:agent:bad-args" \
+    "generic-node:node:generic-node" \
+    "wrong-official-path:node:official-wrong-path" \
+    "wrong-official-leading-option:node:official-wrong-leading-option" \
+    "wrong-official-tail:node:official-extra-tail" \
+    "option-shaped-model:agent:option-shaped-model" \
+    "unowned-agent:agent:unowned"
+  do
+    IFS=: read -r label foreground shape <<<"$spec"
+    fb=$(make_cursor_child_probe "$TMP_ROOT/tmux-$label" "$foreground" "$shape")
+    out=$(PATH="$fb:$BASE_PATH" bash -c \
+      '. "$0/bin/fm-backend.sh"; fm_backend_agent_state tmux sess:win' "$ROOT")
+    [ "$out" = ambiguous ] \
+      || fail "unverified Cursor shape $label must stay ambiguous, got '$out'"
+  done
+  pass "tmux liveness accepts flat spaced models across direct/official exec-a forms while rejecting adversarial lookalikes"
 }
 
 test_tmux_agent_state_rejects_malformed_targets_before_probe() {
@@ -176,6 +315,59 @@ test_herdr_agent_state_preserves_husk_classifier() {
   [ "$out" = dead ] || fail "the Herdr compatibility view should keep a no-agent husk dead, got '$out'"
 
   pass "fm_backend_herdr_agent_state: preserves missing/no-agent/live/unknown husk behavior"
+}
+
+test_herdr_agent_state_recognizes_only_exact_cursor_bridge() {
+  local shape out
+  for shape in exact helper gui node; do
+    out=$(FM_TEST_CURSOR_SHAPE="$shape" bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_pane_presence_state() { printf present; }
+      fm_backend_herdr_cli() {
+        case "$2 $3" in
+          "agent get") printf "%s\n" "{\"error\":{\"code\":\"agent_not_found\"}}" ;;
+          "pane process-info")
+            case "$FM_TEST_CURSOR_SHAPE" in
+              exact) name=fm-cursor-acp ;;
+              helper) name=fm-cursor-acp-helper ;;
+              gui) name=Cursor ;;
+              *) name=node ;;
+            esac
+            printf "%s\n" "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"p1\",\"foreground_processes\":[{\"pid\":410,\"name\":\"$name\",\"argv0\":\"$name\"}]}}}"
+            ;;
+        esac
+      }
+      fm_backend_herdr_agent_state "sess:p1"
+    ' "$ROOT")
+    if [ "$shape" = exact ]; then
+      [ "$out" = alive ] || fail "Herdr exact fm-cursor-acp process should classify alive, got '$out'"
+    else
+      [ "$out" = dead ] \
+        || fail "Herdr Cursor lookalike '$shape' should remain a no-agent endpoint, got '$out'"
+    fi
+  done
+  pass "Herdr recovery recognizes exact fm-cursor-acp and rejects helper, GUI, and node lookalikes"
+}
+
+test_herdr_cursor_send_state_requires_direct_acp_child() {
+  local fb out shape
+  for shape in direct no-child; do
+    fb=$(make_cursor_child_probe "$TMP_ROOT/herdr-cursor-$shape" fm-cursor-acp "$shape")
+    out=$(FM_HERDR_PS_BIN="$fb/ps" bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_pane_agent_state() { printf no-agent; }
+      fm_backend_herdr_cli() {
+        printf "%s\n" "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"p1\",\"foreground_processes\":[{\"pid\":410,\"name\":\"fm-cursor-acp\",\"argv0\":\"fm-cursor-acp\"}]}}}"
+      }
+      fm_backend_herdr_cursor_agent_state "sess:p1"
+    ' "$ROOT")
+    if [ "$shape" = direct ]; then
+      [ "$out" = alive ] || fail "Herdr Cursor bridge with exact direct ACP child should be alive, got '$out'"
+    else
+      [ "$out" != alive ] || fail "Herdr Cursor bridge without an ACP child was accepted for send"
+    fi
+  done
+  pass "Herdr Cursor sends require the exact foreground bridge and its direct ACP child"
 }
 
 # --- unit level: the generic dispatchers ------------------------------------
@@ -410,6 +602,27 @@ test_sweep_respawns_authoritatively_missing_pi_signed_secondmate() {
   pass "sweep: an authoritatively missing pi-signed secondmate window is relaunched"
 }
 
+test_sweep_respawns_authoritatively_missing_cursor_secondmate() {
+  local w fb tmuxfb log out
+  w=$(new_world sweep-missing-cursor)
+  printf '%s\n' cursor > "$w/home/config/secondmate-harness"
+  add_sm_home "$w" sm1 firstmate:fm-sm1 cursor
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" missing "$log")
+
+  assert_not_contains "$out" "unverified for recovery" \
+    "a recorded Cursor secondmate should be verified for recovery"
+  assert_contains "$(cat "$log")" "new-window" \
+    "an authoritatively missing Cursor secondmate should be relaunched"
+  assert_present "$w/home/state/sm1.busy-gen" \
+    "a recovered Cursor secondmate must arm the bridge's required busy generation"
+  assert_grep 'busy_gen=' "$w/home/state/sm1.meta" \
+    "a recovered Cursor secondmate must record its busy generation"
+  pass "sweep: an authoritatively missing Cursor secondmate is verified, re-armed, and relaunched"
+}
+
 test_sweep_never_acts_on_ambiguous_existing_process() {
   local w fb tmuxfb log out
   w=$(new_world sweep-ambiguous)
@@ -527,13 +740,17 @@ test_sweep_noop_with_no_secondmate_meta() {
 }
 
 test_tmux_agent_state_classifies
+test_tmux_agent_state_verifies_cursor_acp_child_ancestry
 test_tmux_agent_state_rejects_malformed_targets_before_probe
 test_herdr_agent_state_preserves_husk_classifier
+test_herdr_agent_state_recognizes_only_exact_cursor_bridge
+test_herdr_cursor_send_state_requires_direct_acp_child
 test_agent_state_dispatcher_and_compatibility
 test_sweep_respawns_confirmed_dead_secondmate
 test_sweep_leaves_alive_secondmate_untouched
 test_sweep_respawns_authoritatively_missing_pi_secondmate
 test_sweep_respawns_authoritatively_missing_pi_signed_secondmate
+test_sweep_respawns_authoritatively_missing_cursor_secondmate
 test_sweep_never_acts_on_ambiguous_existing_process
 test_sweep_never_acts_on_transient_unreadability
 test_sweep_reports_missing_endpoint_relaunch_failure

@@ -67,6 +67,7 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 CLAUDE_MODE=0
+CURSOR_MODE=0
 SYNC_WAIT_MS=${FM_CLAUDE_AUTOARM_SYNC_WAIT_MS:-800}
 EPOCH_FRESH=${FM_CLAUDE_AUTOARM_EPOCH_FRESH:-15}
 BLOCK_BUDGET=${FM_CLAUDE_TURNEND_BLOCK_BUDGET:-3}
@@ -76,8 +77,15 @@ case "$BLOCK_BUDGET" in ''|*[!0-9]*|0) BLOCK_BUDGET=3 ;; esac
 
 for arg in "$@"; do
   case "$arg" in
-    --claude) CLAUDE_MODE=1 ;;
-    *) echo "usage: $(basename "$0") [--claude]" >&2; exit 2 ;;
+    --claude)
+      [ "$CURSOR_MODE" -eq 0 ] || { echo "usage: $(basename "$0") [--claude|--cursor]" >&2; exit 2; }
+      CLAUDE_MODE=1
+      ;;
+    --cursor)
+      [ "$CLAUDE_MODE" -eq 0 ] || { echo "usage: $(basename "$0") [--claude|--cursor]" >&2; exit 2; }
+      CURSOR_MODE=1
+      ;;
+    *) echo "usage: $(basename "$0") [--claude|--cursor]" >&2; exit 2 ;;
   esac
 done
 
@@ -85,6 +93,8 @@ done
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
 # shellcheck source=bin/fm-primary-scope-lib.sh
 . "$SCRIPT_DIR/fm-primary-scope-lib.sh"
+# shellcheck source=bin/fm-operational-input.sh
+. "$SCRIPT_DIR/fm-operational-input.sh"
 
 # Read the whole turn-end hook payload once; never block on unreadable/absent
 # stdin.
@@ -96,15 +106,35 @@ PAYLOAD=$(cat 2>/dev/null || true)
 # loop-guard field, so we must never block - fail open, not noisy.
 command -v jq >/dev/null 2>&1 || exit 0
 
-STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '
-  if type != "object" then error("payload")
-  elif has("stopHookActive") then
-    if ((.stopHookActive | type) == "boolean") then .stopHookActive else error("stopHookActive") end
-  elif has("stop_hook_active") then
-    if ((.stop_hook_active | type) == "boolean") then .stop_hook_active else error("stop_hook_active") end
-  else false
-  end
-' 2>/dev/null) || exit 0
+if [ "$CLAUDE_MODE" -eq 1 ] && printf '%s' "$PAYLOAD" | jq -e '
+  type == "object"
+  and (.cursor_version | type == "string" and length > 0)
+' >/dev/null 2>&1; then
+  exit 0
+fi
+
+if [ "$CURSOR_MODE" -eq 1 ]; then
+  printf '%s' "$PAYLOAD" | jq -e '
+    type == "object"
+    and .hook_event_name == "stop"
+    and (.cursor_version | type == "string" and length > 0)
+    and (.status == "completed" or .status == "aborted" or .status == "error")
+    and (.loop_count | type == "number" and floor == . and . >= 0)
+  ' >/dev/null 2>&1 || exit 0
+  CURSOR_STATUS=$(printf '%s' "$PAYLOAD" | jq -r '.status' 2>/dev/null) || exit 0
+  [ "$CURSOR_STATUS" != aborted ] || exit 0
+  STOP_HOOK_ACTIVE=false
+else
+  STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '
+    if type != "object" then error("payload")
+    elif has("stopHookActive") then
+      if ((.stopHookActive | type) == "boolean") then .stopHookActive else error("stopHookActive") end
+    elif has("stop_hook_active") then
+      if ((.stop_hook_active | type) == "boolean") then .stop_hook_active else error("stop_hook_active") end
+    else false
+    end
+  ' 2>/dev/null) || exit 0
+fi
 if [ "$CLAUDE_MODE" -eq 0 ] && [ "$STOP_HOOK_ACTIVE" = "true" ]; then
   exit 0
 fi
@@ -140,6 +170,23 @@ if [ "$FM_SUP_NEEDED" = false ]; then
 fi
 if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   budget_reset
+  exit 0
+fi
+
+if [ "$CURSOR_MODE" -eq 1 ]; then
+  if [ -e "$STATE/.afk" ]; then
+    FOLLOWUP_BODY='Run bin/fm-wake-drain.sh first. Away mode owns supervision; load /afk and ensure its daemon is running instead of starting a normal watcher cycle.'
+  else
+    X_MODE=0
+    [ -f "$CONFIG/x-mode.env" ] && X_MODE=1
+    REPAIR=$("$SCRIPT_DIR/fm-supervision-instructions.sh" \
+      --harness cursor --x-mode "$X_MODE" --repair-line 2>/dev/null) || exit 0
+    [ -n "$REPAIR" ] || exit 0
+    FOLLOWUP_BODY="Run bin/fm-wake-drain.sh first. $REPAIR When its managed completion notification wakes you, drain and handle the ordinary wake; if supervision is still needed afterward, launch exactly one new cycle. The Stop hook is only the final backstop."
+  fi
+  FOLLOWUP=
+  fm_operational_input_encode turn-end-guard "$FOLLOWUP_BODY" FOLLOWUP || exit 0
+  jq -cn --arg followup_message "$FOLLOWUP" '{followup_message:$followup_message}'
   exit 0
 fi
 
