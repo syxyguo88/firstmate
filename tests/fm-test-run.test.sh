@@ -15,9 +15,10 @@ RUNNER="$ROOT/bin/fm-test-run.sh"
 assert_present "$RUNNER" "bin/fm-test-run.sh is missing"
 [ -x "$RUNNER" ] || fail "bin/fm-test-run.sh must be executable"
 
-without_cursor_live_env() {
-  env -u FM_CURSOR_LIVE_E2E -u FM_CURSOR_CLI_CONTRACT_E2E "$@"
-}
+without_cursor_live_env() (
+  unset FM_CURSOR_LIVE_E2E FM_CURSOR_CLI_CONTRACT_E2E
+  "$@"
+)
 
 test_list_all_exact_suite_coverage() {
   local listed expected missing extra f
