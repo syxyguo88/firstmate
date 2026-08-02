@@ -54,17 +54,12 @@ fm_cursor_explicit_process_matches() {
   esac
 }
 
-# True when one process in the current ancestry is Cursor.
-# The generic official `agent` name additionally requires the inherited Cursor
-# marker. This keeps marker-only environments and ordinary agent processes from
-# claiming current-session identity while external holder checks remain stable.
+# True when one process in the current ancestry is Cursor. ACP tool processes
+# do not inherit CURSOR_AGENT, so the generic official `agent` form relies on
+# the same constrained versioned-entry evidence used for external lock holders.
+# A marker alone still grants no identity.
 fm_cursor_process_matches() {
   local comm=$1 args=$2
-  case "$(basename -- "$comm")" in
-    agent)
-      [ "${CURSOR_AGENT:-}" = "1" ] || return 1
-      ;;
-  esac
   fm_cursor_explicit_process_matches "$comm" "$args"
 }
 

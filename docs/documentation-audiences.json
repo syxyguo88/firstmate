@@ -228,6 +228,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/cursor.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/decision-hold-lifecycle.md",
       "audience": "maintainer-architecture"
     },
@@ -281,6 +285,10 @@
     },
     {
       "path": "docs/supervision-protocols/codex.md",
+      "audience": "agent-runtime"
+    },
+    {
+      "path": "docs/supervision-protocols/cursor.md",
       "audience": "agent-runtime"
     },
     {

@@ -75,6 +75,9 @@ or `session/load`, followed by `session/prompt`. The bridge:
   `state/<id>.cursor-session.json` with mode `0600`;
 - restores that exact session on a later launch instead of guessing from
   Cursor's most-recent session;
+- proves session-lock ownership from the constrained versioned Cursor `agent`
+  ancestry because ACP tool processes do not inherit `CURSOR_AGENT`; the marker
+  alone is never accepted;
 - accepts one CR/LF-free prompt per stdin line, which is the Cursor transport
   used by `fm-send.sh`; tmux requires the exact bridge plus its constrained ACP
   child, Herdr correlates its exact foreground bridge PID with the same

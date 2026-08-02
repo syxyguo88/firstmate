@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Behavior tests for Cursor harness detection and session-lock identity.
-# Cursor's official `agent` command is accepted only when its inherited marker
-# accompanies an explicit cursor-agent executable identity; exact cursor-agent
-# processes and the legacy Node index.js shape remain independently detectable.
+# Cursor's official `agent` command is accepted from its explicit versioned
+# cursor-agent entry path even when ACP tool processes do not inherit
+# CURSOR_AGENT; plain `agent` processes and path lookalikes remain rejected.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -134,7 +134,7 @@ test_legacy_node_identity() {
   pass "Cursor identity: constrained versions/index.js ancestry preserves legacy Node compatibility"
 }
 
-test_official_agent_requires_marker_and_explicit_identity() {
+test_official_agent_uses_explicit_identity_without_marker() {
   local shape got
   got=$(detect_shape official-agent CURSOR_AGENT=1 CURSOR_INVOKED_AS=agent)
   [ "$got" = cursor ] || fail "marked official agent resolved '$got', expected cursor"
@@ -145,10 +145,10 @@ test_official_agent_requires_marker_and_explicit_identity() {
     || fail "session-lock liveness rejected marked official agent pid"
 
   got=$(detect_shape official-agent)
-  [ "$got" = unknown ] || fail "unmarked official agent resolved '$got', expected unknown"
-  if ancestry_shape official-agent >/dev/null; then
-    fail "current ancestry accepted unmarked process named agent"
-  fi
+  [ "$got" = cursor ] || fail "unmarked explicit official agent resolved '$got', expected cursor"
+  got=$(ancestry_shape official-agent) \
+    || fail "ACP-style unmarked ancestry rejected explicit official Cursor agent"
+  [ "$got" = 4100 ] || fail "unmarked official agent ancestry selected '$got', expected pid 4100"
   alive_shape official-agent 4100 \
     || fail "external liveness observer rejected explicit official cursor-agent identity without inheriting CURSOR_AGENT"
 
@@ -213,7 +213,7 @@ test_runner_classifies_cursor_contract_suite() {
 test_native_cursor_agent_identity
 test_legacy_node_identity
 test_cursor_lookalikes_are_rejected
-test_official_agent_requires_marker_and_explicit_identity
+test_official_agent_uses_explicit_identity_without_marker
 test_marker_only_does_not_steal_real_ancestry
 test_existing_marker_precedence_is_unchanged
 test_runner_classifies_cursor_contract_suite
